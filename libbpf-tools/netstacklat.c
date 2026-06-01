@@ -26,7 +26,7 @@ static const char *__doc__ =
 #include <linux/net_tstamp.h>
 
 #include "netstacklat.h"
-#include "netstacklat.bpf.skel.h"
+#include "netstacklat.skel.h"
 
 #define MAX_EPOLL_EVENTS 8
 
