@@ -69,6 +69,7 @@ APPS = \
 	ksnoop \
 	llcstat \
 	mdflush \
+	netstacklat \
 	mountsnoop \
 	numamove \
 	offcputime \
