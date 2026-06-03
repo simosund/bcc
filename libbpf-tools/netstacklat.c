@@ -787,28 +787,21 @@ static void print_histbar(FILE *stream, __u64 count, __u64 max_count)
 	fprintf(stream, "|");
 }
 
-static void print_log2hist(FILE *stream, size_t n, const __u64 hist[n],
-			   double multiplier)
+static __u64 print_log2hist(FILE *stream, size_t n, const __u64 hist[n])
 {
 	int bucket, start_bucket, end_bucket, max_bucket, len;
-	double low_bound, high_bound, avg;
+	double low_bound, high_bound;
 	__u64 count = 0;
-	char *prefix;
 
-	start_bucket = find_first_nonzero_bucket(n - 1, hist);
-	end_bucket = find_last_nonzero_bucket(n - 1, hist);
-	max_bucket = find_largest_bucket(n - 1, hist);
+	start_bucket = find_first_nonzero_bucket(n, hist);
+	end_bucket = find_last_nonzero_bucket(n, hist);
+	max_bucket = find_largest_bucket(n, hist);
 
 	for (bucket = max(0, start_bucket); bucket <= end_bucket; bucket++) {
-		low_bound = pow(2, bucket - 1) * multiplier;
-		high_bound = pow(2, bucket) * multiplier;
-
 		// First bucket includes 0 (i.e. [0, 1] rather than (0.5, 1])
-		if (bucket == 0)
-			low_bound = 0;
+		low_bound = bucket > 0 ? 1ULL << (bucket - 1) : 0;
 		// Last bucket includes all values too large for the second-last bucket
-		if (bucket == n - 2)
-			high_bound = INFINITY;
+		high_bound = bucket < n - 1 ? 1ULL << bucket : INFINITY;
 
 		len = print_bucket_interval(stream, low_bound, high_bound);
 		print_nchars(stream, ' ',
@@ -820,14 +813,7 @@ static void print_log2hist(FILE *stream, size_t n, const __u64 hist[n],
 		count += hist[bucket];
 	}
 
-	// Final "bucket" is the sum of all values in the histogram
-	if (count > 0) {
-		avg = ns_to_siprefix((double)hist[n - 1] / count, &prefix);
-		fprintf(stream, "count: %llu, average: %.2f%ss\n", count, avg,
-			prefix);
-	} else {
-		fprintf(stream, "count: %llu, average: -\n", count);
-	}
+	return count;
 }
 
 static void print_histkey(FILE *stream, const struct hist_key *key)
@@ -839,6 +825,30 @@ static void print_histkey(FILE *stream, const struct hist_key *key)
 
 	if (key->cgroup)
 		fprintf(stream, ", cgroup=%llu", key->cgroup);
+}
+
+static void print_histentry(FILE *stream, const struct histogram_entry *entry)
+{
+	char *prefix;
+	__u64 count;
+	double avg;
+
+	print_histkey(stream, &entry->key);
+	fprintf(stream, ":\n");
+
+	count = print_log2hist(stdout, HIST_NBUCKETS - 1, entry->buckets);
+
+	// Final "bucket" is the sum of all values in the histogram
+	if (count > 0) {
+		avg = ns_to_siprefix((double)entry->buckets[HIST_NBUCKETS - 1] /
+					     count,
+				     &prefix);
+		fprintf(stream, "count: %llu, average: %.2f%ss\n", count, avg,
+			prefix);
+	} else {
+		fprintf(stream, "count: %llu, average: -\n", count);
+	}
+	fprintf(stream, "\n");
 }
 
 static int cmp_histkey(const void *val1, const void *val2)
@@ -1033,11 +1043,7 @@ static int report_stats(const struct netstacklat_bpf *obj,
 	printf("%s", ctime(&t));
 
 	for (i = 0; i < hist_buf->current_size; i++) {
-		print_histkey(stdout, &hist_buf->hists[i].key);
-		printf(":\n");
-		print_log2hist(stdout, HIST_NBUCKETS,
-			       hist_buf->hists[i].buckets, 1);
-		printf("\n");
+		print_histentry(stdout, &hist_buf->hists[i]);
 	}
 	fflush(stdout);
 
