@@ -1,6 +1,4 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
-static const char *__doc__ =
-	"Netstacklat - Monitor latency to various points in the ingress network stack";
 
 #define _GNU_SOURCE // to get name_to_handle_at
 #include <stdio.h>
@@ -9,7 +7,7 @@ static const char *__doc__ =
 #include <signal.h>
 #include <time.h>
 #include <math.h>
-#include <getopt.h>
+#include <argp.h>
 #include <ctype.h>
 #include <fcntl.h>
 #include <net/if.h>
@@ -71,9 +69,11 @@ struct histogram_buffer {
 	size_t current_size;
 };
 
-struct netstacklat_config {
+struct env {
 	struct netstacklat_bpf_config bpf_conf;
 	double report_interval_s;
+	bool has_enabled_hooks;
+	bool has_disabled_hooks;
 	bool enabled_hooks[NETSTACKLAT_N_HOOKS];
 	int npids;
 	int nifindices;
@@ -83,94 +83,82 @@ struct netstacklat_config {
 	__u64 cgroups[MAX_PARSED_CGROUPS];
 };
 
-static const struct option long_options[] = {
-	{ "help",                  no_argument,       NULL, 'h' },
-	{ "report-interval",       required_argument, NULL, 'r' },
-	{ "list-probes",           no_argument,       NULL, 'l' },
-	{ "enable-probes",         required_argument, NULL, 'e' },
-	{ "disable-probes",        required_argument, NULL, 'd' },
-	{ "pids",                  required_argument, NULL, 'p' },
-	{ "interfaces",            required_argument, NULL, 'i' },
-	{ "network-namespace",     required_argument, NULL, 'n' },
-	{ "cgroups",               required_argument, NULL, 'c' },
-	{ "min-queuelength",       required_argument, NULL, 'q' },
-	{ "groupby-interface",     no_argument,       NULL, 'I' },
-	{ "groupby-cgroup",        no_argument,       NULL, 'C' },
-	{ "include-tcp-hol-delay", no_argument,       NULL, 'y' },
-	{ 0, 0, 0, 0 }
+const char *argp_program_version = "netstacklat 0.1";
+const char *argp_program_bug_address =
+	"https://github.com/iovisor/bcc/tree/master/libbpf-tools";
+const char argp_program_doc[] =
+"Monitor latency at various points in the ingress network stack\n"
+"\n"
+"USAGE: netstacklat [--help] [-l] [-I] [-C] [-r SEC] [-e PROBES | -d PROBES]\n"
+"                   [-i IFACES] [-c CGROUPS] [-p PIDS] [-n NETNS] [-q NUM]\n"
+"                   [-m PATH] [-y]\n"
+"\n"
+"EXAMPLES:\n"
+"    netstacklat            # trace ingress host network latency system-wide\n"
+"    netstacklat -l         # list all available netstacklat probe points\n"
+"    netstacklat -e PROBES  # only trace latency at PROBES\n"
+"    netstacklat -d PROBES  # trace latency for all points expect PROBES\n"
+"    netstacklat -r N       # print N second summeries\n"
+"    netstacklat -I -C      # separate summeries for each interface and cgroup\n"
+"    netstacklat -i IFACES  # filter for interface(s) IFACES\n"
+"    netstacklat -c CGROUPS # filter for cgroup(s) CGROUPS\n";
+
+static const struct argp_option opts[] = {
+	{ "report-interval", 'r', "SEC", 0, "reporting interval in seconds",
+	  0 },
+	{ "include-hol-delay", 'y', NULL, 0,
+	  "include delays from reads that are head-of-line blocked (only for tcp-socket-read)",
+	  0 },
+
+	{ "Probe points:", 0, NULL, OPTION_DOC, NULL, 0 },
+	{ "enable-probes", 'e', "PROBES", 0,
+	  "comma-separated list of probes to include", 1 },
+	{ "disable-probes", 'd', "PROBES", 0,
+	  "comma-separated list of probes to exclude", 1 },
+	{ "list-probes", 'l', NULL, 0, "list all probe points", 1 },
+
+	{ "Filtering:", 0, NULL, OPTION_DOC, NULL, 1 },
+	{ "pids", 'p', "PIDS", 0,
+	  "comma-separated list of pids to include (only affects socket-read probes)",
+	  2 },
+	{ "cgroups", 'c', "CGROUPS", 0,
+	  "comma-separated list of cgroups to include (only affects socket-read probes)",
+	  2 },
+	{ "interfaces", 'i', "IFACES", 0,
+	  "comma-separated list of interfaces to include", 2 },
+	{ "netns", 'n', "NETNS-ID", 0,
+	  "network namespace identifier to monitor (-1 for all, 0 for current (default))",
+	  2 },
+	{ "min-queuelength", 'q', "NUM", 0,
+	  "Only report socket reads when the socket receive queue is at least NUM SKBs",
+	  2 },
+
+	{ "Grouping:", 0, NULL, OPTION_DOC, NULL, 2 },
+	{ "groupby-interface", 'I', NULL, 0, "group the results per interface",
+	  3 },
+	{ "groupby-cgroup", 'C', NULL, 0,
+	  "group the results per cgroup (only affects socket-read probes)", 3 },
+	{ "Info:", 0, NULL, OPTION_DOC, NULL, -2 },
+	{ 0 },
 };
 
-static const struct option *optval_to_longopt(int val)
+static const struct argp_option *argp_opt_from_key(int key)
 {
 	int i;
 
-	for (i = 0; long_options[i].name != 0; i++) {
-		if (long_options[i].val == val)
-			return &long_options[i];
+	for (i = 0; opts[i].key != 0 || opts[i].flags != 0; i++) {
+		if (opts[i].key == key)
+			return &opts[i];
 	}
 
 	return NULL;
 }
 
-static int generate_optstr(char *buf, size_t size)
+static const char *argp_name_from_key(int key)
 {
-	char *end = buf + size - 1, *p = buf;
-	int i, ret = -E2BIG;
+	const struct argp_option *opt = argp_opt_from_key(key);
 
-	if (size <= 0)
-		return -E2BIG;
-
-	for (i = 0; long_options[i].name; i++) {
-		if (long_options[i].flag || !isalnum(long_options[i].val))
-			continue;
-
-		if (p >= end)
-			goto out;
-		*p++ = (unsigned char)long_options[i].val;
-
-		if (long_options[i].has_arg) {
-			if (p >= end)
-				goto out;
-			*p++ = ':';
-		}
-
-		if (long_options[i].has_arg == optional_argument) {
-			if (p >= end)
-				goto out;
-			*p++ = ':';
-		}
-	}
-
-	ret = (p - buf) + 1;
-out:
-	*p = '\0';
-	return ret;
-}
-
-static void print_usage(FILE *stream, const char *prog_name)
-{
-	int i;
-
-	fprintf(stream, "\nDOCUMENTATION:\n%s\n", __doc__);
-	fprintf(stream, "\n");
-	fprintf(stream, " Usage: %s (options-see-below)\n", prog_name);
-	fprintf(stream, " Listing options:\n");
-	for (i = 0; long_options[i].name != 0; i++) {
-		if (!long_options[i].flag && isalnum(long_options[i].val))
-			fprintf(stream, " -%c, ", long_options[i].val);
-		else
-			fprintf(stream, "     ");
-
-		printf(" --%s", long_options[i].name);
-
-		if (long_options[i].has_arg == required_argument)
-			fprintf(stream, " <ARG>");
-		else if (long_options[i].has_arg == optional_argument)
-			fprintf(stream, "[ARG]");
-
-		fprintf(stream, "\n");
-	}
-	printf("\n");
+	return opt ? opt->name : "";
 }
 
 static const char *hook_to_str(enum netstacklat_hook hook)
@@ -219,7 +207,7 @@ static const char *hook_to_description(enum netstacklat_hook hook)
 	case NETSTACKLAT_HOOK_TCP_SOCK_ENQUEUED:
 		return "packet has been enqueued to a TCP socket, i.e. end of the kernel receive stack";
 	case NETSTACKLAT_HOOK_UDP_SOCK_ENQUEUED:
-		return "packed has been enqueued to a UDP socket, i.e. end of the kernel receive stack";
+		return "packet has been enqueued to a UDP socket, i.e. end of the kernel receive stack";
 	case NETSTACKLAT_HOOK_TCP_SOCK_READ:
 		return "packet payload has been read from TCP socket, i.e. delivered to user space";
 	case NETSTACKLAT_HOOK_UDP_SOCK_READ:
@@ -547,157 +535,148 @@ static int parse_cgroups(size_t size, __u64 arr[size], const char *str)
 	return parse_strlist_to_arr(str, arr, size, sizeof(*arr), ",", parse_cgroup);
 }
 
-static int parse_arguments(int argc, char *argv[],
-			   struct netstacklat_config *conf)
+static error_t parse_arg(int key, char *arg, struct argp_state *state)
 {
-	bool hooks_on = false, hooks_off = false;
-	bool hooks[NETSTACKLAT_N_HOOKS];
-	long long network_ns = 0;
-	int opt, err, ret, i;
-	char optstr[64];
+	struct env *env = state->input;
 	long long lval;
 	double fval;
+	int i, ret;
 
-	conf->npids = 0;
-	conf->nifindices = 0;
-	conf->bpf_conf.filter_min_sockqueue_len = 0;
-	conf->bpf_conf.filter_pid = false;
-	conf->bpf_conf.filter_ifindex = false;
-	conf->bpf_conf.filter_cgroup = false;
-	conf->bpf_conf.groupby_ifindex = false;
-	conf->bpf_conf.groupby_cgroup = false;
-	conf->bpf_conf.include_hol_blocked = false;
+	switch (key) {
+	case 'r': // report-interval
+		ret = parse_bounded_double(&fval, arg, 0.01, 3600 * 24,
+					   argp_name_from_key(key));
+		if (ret)
+			goto err_parse_arg;
 
-	for (i = 0; i < NETSTACKLAT_N_HOOKS; i++)
-		// All probes enabled by default
-		conf->enabled_hooks[i] = true;
+		env->report_interval_s = fval;
+		break;
+	case 'y': // include-hol-delay
+		env->bpf_conf.include_hol_blocked = true;
+		break;
+	case 'e': // enable-probes
+		if (env->has_disabled_hooks)
+			goto err_enable_and_disable_probes;
 
-	ret = generate_optstr(optstr, sizeof(optstr));
-	if (ret < 0) {
-		fprintf(stderr,
-			"Internal error: optstr too short to fit all long_options\n");
-		return ret;
-	}
+		ret = parse_hooks(env->enabled_hooks, arg);
+		if (ret)
+			goto err_parse_arg;
 
-	while ((opt = getopt_long(argc, argv, optstr, long_options,
-				  NULL)) != -1) {
-		switch (opt) {
-		case 'r': // report interval
-			err = parse_bounded_double(
-				&fval, optarg, 0.01, 3600 * 24,
-				optval_to_longopt(opt)->name);
-			if (err)
-				return err;
+		env->has_enabled_hooks = true;
+		break;
+	case 'd': // disable-probes
+		if (env->has_enabled_hooks)
+			goto err_enable_and_disable_probes;
 
-			conf->report_interval_s = fval;
-			break;
-		case 'l': // list-probes
-			list_hooks(stdout);
-			exit(EXIT_SUCCESS);
-		case 'e': // enable-probes
-			err = parse_hooks(hooks, optarg);
-			if (err)
-				return err;
+		ret = parse_hooks(env->enabled_hooks, arg);
+		if (ret)
+			goto err_parse_arg;
 
-			for (i = 1; i < NETSTACKLAT_N_HOOKS; i++)
-				conf->enabled_hooks[i] = hooks[i];
-			hooks_on = true;
-			break;
-		case 'd': // disable-probes
-			err = parse_hooks(hooks, optarg);
-			if (err)
-				return err;
+		// invert enabled -> disabled
+		for (i = 1; i < NETSTACKLAT_N_HOOKS; i++)
+			env->enabled_hooks[i] = !env->enabled_hooks[i];
 
-			for (i = 1; i < NETSTACKLAT_N_HOOKS; i++)
-				conf->enabled_hooks[i] = !hooks[i];
-			hooks_off = true;
-			break;
-		case 'p': // pids
-			ret = parse_pids(ARRAY_SIZE(conf->pids) - conf->npids,
-					 conf->pids + conf->npids, optarg);
-			if (ret < 0)
-				return ret;
+		env->has_disabled_hooks = true;
+		break;
+	case 'l': // list-probes
+		list_hooks(stdout);
+		exit(EXIT_SUCCESS); // return some code?
+		break;
+	case 'p': // pids
+		ret = parse_pids(ARRAY_SIZE(env->pids) - env->npids,
+				 env->pids + env->npids, arg);
+		if (ret < 0)
+			goto err_parse_arg;
 
-			conf->npids += ret;
-			conf->bpf_conf.filter_pid = true;
-			break;
-		case 'i': // interfaces
-			ret = parse_ifaces(
-				ARRAY_SIZE(conf->ifindices) - conf->nifindices,
-				conf->ifindices + conf->nifindices, optarg);
-			if (ret < 0)
-				return ret;
+		env->npids += ret;
+		env->bpf_conf.filter_pid = true;
+		break;
+	case 'c': // cgroups
+		ret = parse_cgroups(ARRAY_SIZE(env->cgroups) - env->ncgroups,
+				    env->cgroups + env->ncgroups, arg);
+		if (ret < 0)
+			goto err_parse_arg;
 
-			conf->nifindices += ret;
-			conf->bpf_conf.filter_ifindex = true;
-			break;
-		case 'n': // network-namespace
-			err = parse_bounded_long(&network_ns, optarg, -1,
-						 UINT32_MAX,
-						 optval_to_longopt(opt)->name);
-			if (err)
-				return err;
-			break;
-		case 'c': // cgroups
-			ret = parse_cgroups(
-				ARRAY_SIZE(conf->cgroups) - conf->ncgroups,
-				conf->cgroups + conf->ncgroups, optarg);
-			if (ret < 0)
-				return ret;
+		env->ncgroups += ret;
+		env->bpf_conf.filter_cgroup = true;
+		break;
+	case 'i': // interfaces
+		ret = parse_ifaces(ARRAY_SIZE(env->ifindices) - env->nifindices,
+				   env->ifindices + env->nifindices, arg);
+		if (ret < 0)
+			goto err_parse_arg;
 
-			conf->ncgroups += ret;
-			conf->bpf_conf.filter_cgroup = true;
-			break;
-		case 'q': // min-queuelength
-			err = parse_bounded_long(&lval, optarg, 0, 65536,
-						 optval_to_longopt(opt)->name);
-			if (err)
-				return err;
-			conf->bpf_conf.filter_min_sockqueue_len = lval;
-			break;
-		case 'I': // groupby-interface
-			conf->bpf_conf.groupby_ifindex = true;
-			break;
-		case 'C': // groupby-cgroup
-			conf->bpf_conf.groupby_cgroup = true;
-			break;
-		case 'y': // include-tcp-hol-delay
-			conf->bpf_conf.include_hol_blocked = true;
-			break;
-		case 'h': // help
-			print_usage(stdout, argv[0]);
-			exit(EXIT_SUCCESS);
-		default:
-			// unrecognized option reported by getopt, so just print usage
-			print_usage(stderr, argv[0]);
-			return -EINVAL;
-		}
-	}
+		env->nifindices += ret;
+		env->bpf_conf.filter_ifindex = true;
+		break;
+	case 'n': // netns
+		ret = parse_bounded_long(&lval, arg, -1, UINT32_MAX,
+					 argp_name_from_key(key));
+		if (ret)
+			goto err_parse_arg;
 
-	if (hooks_on && hooks_off) {
-		fprintf(stderr,
-			"%s and %s are mutually exclusive, only use one of them\n",
-			optval_to_longopt('e')->name,
-			optval_to_longopt('d')->name);
-		return -EINVAL;
-	}
+		if (lval < 0) // include all netns (no filtering)
+			env->bpf_conf.network_ns = 0;
+		else if (lval == 0) // use current netns
+			; // keep initialized value
+		else
+			env->bpf_conf.network_ns = lval;
+		break;
+	case 'q': // min-queuelength
+		ret = parse_bounded_long(&lval, arg, 0, 65536,
+					 argp_name_from_key(key));
+		if (ret)
+			goto err_parse_arg;
 
-	if (network_ns < 0) {
-		conf->bpf_conf.network_ns = 0;
-	} else if (network_ns == 0) {
-		network_ns = get_current_network_ns();
-		if (network_ns < 0) {
-			fprintf(stderr,
-				"Failed getting current network namespace: %s\n",
-				strerror(-network_ns));
-			return network_ns;
-		}
-		conf->bpf_conf.network_ns = network_ns;
-	} else {
-		conf->bpf_conf.network_ns = network_ns;
+		env->bpf_conf.filter_min_sockqueue_len = lval;
+		break;
+	case 'I': // groupby-interface
+		env->bpf_conf.groupby_ifindex = true;
+		break;
+	case 'C': // groupby-cgroup
+		env->bpf_conf.groupby_cgroup = true;
+		break;
+	default:
+		return ARGP_ERR_UNKNOWN;
 	}
 
 	return 0;
+
+err_parse_arg:
+	argp_error(state, "failed parsing %s: %s", argp_name_from_key(key),
+		   strerror(-ret));
+	return -ret;
+err_enable_and_disable_probes:
+	argp_error(state, "%s and %s are mutually exclusive, only use one\n",
+		   argp_name_from_key('e'), argp_name_from_key('d'));
+	return EEXIST;
+}
+
+static int parse_args(int argc, char *argv[], struct env *env)
+{
+	struct argp argp = { .options = opts,
+			     .parser = parse_arg,
+			     .doc = argp_program_doc };
+	long long current_netns;
+	int i;
+
+	memset(env, 0, sizeof(*env));
+	env->report_interval_s = 0;
+
+	for (i = 0; i < NETSTACKLAT_N_HOOKS; i++)
+		// All probes enabled by default
+		env->enabled_hooks[i] = true;
+
+	current_netns = get_current_network_ns();
+	if (current_netns < 0) {
+		fprintf(stderr,
+			"Failed getting current network namespace: %s\n",
+			strerror(-current_netns));
+		return -current_netns;
+	}
+	env->bpf_conf.network_ns = current_netns;
+
+	return -argp_parse(&argp, argc, argv, 0, NULL, env);
 }
 
 static int find_first_nonzero_bucket(size_t n, const __u64 hist[n])
@@ -1084,23 +1063,23 @@ static int report_stats(const struct netstacklat_bpf *obj,
 }
 
 static int init_histogram_buffer(struct histogram_buffer *buf,
-				 const struct netstacklat_config *conf)
+				 const struct env *env)
 {
 	int max_hists = 0, i;
 
 	for (i = 0; i < NETSTACKLAT_N_HOOKS; i++) {
-		if (conf->enabled_hooks[i])
+		if (env->enabled_hooks[i])
 			max_hists++;
 	}
 
-	if (conf->bpf_conf.groupby_ifindex)
-		max_hists *= conf->bpf_conf.filter_ifindex ?
-				     min(conf->nifindices, 64) :
+	if (env->bpf_conf.groupby_ifindex)
+		max_hists *= env->bpf_conf.filter_ifindex ?
+				     min(env->nifindices, 64) :
 				     32;
 
-	if (conf->bpf_conf.groupby_cgroup)
-		max_hists *= conf->bpf_conf.filter_cgroup ?
-				     min(conf->ncgroups, 128) :
+	if (env->bpf_conf.groupby_cgroup)
+		max_hists *= env->bpf_conf.filter_cgroup ?
+				     min(env->ncgroups, 128) :
 				     64;
 
 	buf->hists = calloc(max_hists, sizeof(*buf->hists));
@@ -1157,7 +1136,7 @@ static __s64 get_tai_offset(void)
 	return ntpt.tai;
 }
 
-static void set_programs_to_load(const struct netstacklat_config *conf,
+static void set_programs_to_load(const struct env *env,
 				 struct netstacklat_bpf *obj)
 {
 	struct hook_prog_collection progs;
@@ -1169,11 +1148,11 @@ static void set_programs_to_load(const struct netstacklat_config *conf,
 
 		for (i = 0; i < progs.nprogs; i++)
 			bpf_program__set_autoload(progs.progs[i],
-						  conf->enabled_hooks[hook]);
+						  env->enabled_hooks[hook]);
 	}
 }
 
-static int set_map_sizes(const struct netstacklat_config *conf,
+static int set_map_sizes(const struct env *env,
 			 struct netstacklat_bpf *obj, int max_hists)
 {
 	__u32 size;
@@ -1189,9 +1168,9 @@ static int set_map_sizes(const struct netstacklat_config *conf,
 	}
 
 	// PID filter - arraymap, needs max PID + 1 entries
-	for (i = 0, size = 1; i < conf->npids; i++) {
-		if (conf->pids[i] >= size)
-			size = conf->pids[i] + 1;
+	for (i = 0, size = 1; i < env->npids; i++) {
+		if (env->pids[i] >= size)
+			size = env->pids[i] + 1;
 	}
 	err = bpf_map__set_max_entries(obj->maps.netstack_pidfilter, size);
 	if (err) {
@@ -1201,9 +1180,9 @@ static int set_map_sizes(const struct netstacklat_config *conf,
 	}
 
 	// ifindex filter - arraymap, needs max ifindex + 1 entries
-	for (i = 0, size = 1; i < conf->nifindices; i++) {
-		if (conf->ifindices[i] >= size)
-			size = conf->ifindices[i] + 1;
+	for (i = 0, size = 1; i < env->nifindices; i++) {
+		if (env->ifindices[i] >= size)
+			size = env->ifindices[i] + 1;
 	}
 	err = bpf_map__set_max_entries(obj->maps.netstack_ifindexfilter, size);
 	if (err) {
@@ -1214,7 +1193,7 @@ static int set_map_sizes(const struct netstacklat_config *conf,
 	}
 
 	// cgroup filter - hashmap, should be ~2x expected number of entries
-	size = conf->bpf_conf.filter_cgroup ? conf->ncgroups * 2 : 1;
+	size = env->bpf_conf.filter_cgroup ? env->ncgroups * 2 : 1;
 	err = bpf_map__set_max_entries(obj->maps.netstack_cgroupfilter, size);
 	if (err) {
 		fprintf(stderr,
@@ -1407,21 +1386,19 @@ static int poll_events(int epoll_fd, const struct netstacklat_bpf *obj,
 int main(int argc, char *argv[])
 {
 	int sig_fd, timer_fd, epoll_fd, sock_fd, err;
-	struct netstacklat_config config = {
-		.report_interval_s = 5,
-	};
+	struct env env;
 	struct histogram_buffer hist_buf;
 	struct netstacklat_bpf *obj;
 	char errmsg[128];
 
-	err = parse_arguments(argc, argv, &config);
+	err = parse_args(argc, argv, &env);
 	if (err) {
 		fprintf(stderr, "Failed parsing arguments: %s\n",
-			strerror(-err));
+			strerror(err));
 		return EXIT_FAILURE;
 	}
 
-	err = init_histogram_buffer(&hist_buf, &config);
+	err = init_histogram_buffer(&hist_buf, &env);
 	if (err) {
 		fprintf(stderr, "Failed allocating buffer for histograms: %s\n",
 			strerror(-err));
@@ -1446,11 +1423,11 @@ int main(int argc, char *argv[])
 	}
 
 	obj->rodata->TAI_OFFSET = get_tai_offset() * NS_PER_S;
-	obj->rodata->user_config = config.bpf_conf;
+	obj->rodata->user_config = env.bpf_conf;
 
-	set_programs_to_load(&config, obj);
+	set_programs_to_load(&env, obj);
 
-	err = set_map_sizes(&config, obj, hist_buf.max_size);
+	err = set_map_sizes(&env, obj, hist_buf.max_size);
 	if (err) {
 		libbpf_strerror(err, errmsg, sizeof(errmsg));
 		fprintf(stderr, "Failed configuring map sizes: %s\n", errmsg);
@@ -1465,7 +1442,7 @@ int main(int argc, char *argv[])
 	}
 
 	err = init_filtermap(bpf_map__fd(obj->maps.netstack_pidfilter),
-			     config.pids, config.npids, sizeof(*config.pids));
+			     env.pids, env.npids, sizeof(*env.pids));
 
 	if (err) {
 		libbpf_strerror(err, errmsg, sizeof(errmsg));
@@ -1475,8 +1452,8 @@ int main(int argc, char *argv[])
 	}
 
 	err = init_filtermap(bpf_map__fd(obj->maps.netstack_ifindexfilter),
-			     config.ifindices, config.nifindices,
-			     sizeof(*config.ifindices));
+			     env.ifindices, env.nifindices,
+			     sizeof(*env.ifindices));
 	if (err) {
 		libbpf_strerror(err, errmsg, sizeof(errmsg));
 		fprintf(stderr, "Failed filling the ifindex filter map: %s\n",
@@ -1485,8 +1462,8 @@ int main(int argc, char *argv[])
 	}
 
 	err = init_filtermap(bpf_map__fd(obj->maps.netstack_cgroupfilter),
-			     config.cgroups, config.ncgroups,
-			     sizeof(*config.cgroups));
+			     env.cgroups, env.ncgroups,
+			     sizeof(*env.cgroups));
 	if (err) {
 		libbpf_strerror(err, errmsg, sizeof(errmsg));
 		fprintf(stderr, "Failed filling the cgroup filter map: %s\n",
@@ -1509,7 +1486,7 @@ int main(int argc, char *argv[])
 		goto exit_detach_bpf;
 	}
 
-	timer_fd = setup_timer(config.report_interval_s * NS_PER_S);
+	timer_fd = setup_timer(env.report_interval_s * NS_PER_S);
 	if (timer_fd < 0) {
 		err = timer_fd;
 		fprintf(stderr, "Failed creating timer: %s\n", strerror(-err));
