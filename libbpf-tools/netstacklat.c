@@ -61,7 +61,8 @@ struct hook_prog_collection {
 
 struct histogram_entry {
 	struct hist_key key;
-	__u64 *buckets;
+	__u64 *current_buckets;
+	__u64 *prev_buckets;
 };
 
 struct histogram_buffer {
@@ -827,22 +828,45 @@ static void print_histkey(FILE *stream, const struct hist_key *key)
 		fprintf(stream, ", cgroup=%llu", key->cgroup);
 }
 
-static void print_histentry(FILE *stream, const struct histogram_entry *entry)
+static __u64 diff_histentry(struct histogram_entry *entry, size_t n,
+			    __u64 diff[n - 1], __u64 *sum)
 {
+	__u64 count = 0;
+	int i;
+
+	for (i = 0; i < n - 1; i++) {
+		diff[i] = entry->current_buckets[i] - entry->prev_buckets[i];
+		entry->prev_buckets[i] = entry->current_buckets[i];
+		count += diff[i];
+	}
+
+	// The last "bucket" is actually a sum
+	*sum = entry->current_buckets[n - 1] - entry->prev_buckets[n - 1];
+	entry->prev_buckets[n - 1] = entry->current_buckets[n - 1];
+
+	return count;
+}
+
+static void print_histentry(FILE *stream, struct histogram_entry *entry)
+{
+	__u64 diff[HIST_NBUCKETS - 1];
+	__u64 count, sum;
 	char *prefix;
-	__u64 count;
 	double avg;
+
+	count = diff_histentry(entry, HIST_NBUCKETS, diff, &sum);
+	// Skip reporting entires with no change (empty histogram)
+	if (!count)
+		return;
 
 	print_histkey(stream, &entry->key);
 	fprintf(stream, ":\n");
 
-	count = print_log2hist(stdout, HIST_NBUCKETS - 1, entry->buckets);
+	print_log2hist(stream, ARRAY_SIZE(diff), diff);
 
 	// Final "bucket" is the sum of all values in the histogram
 	if (count > 0) {
-		avg = ns_to_siprefix((double)entry->buckets[HIST_NBUCKETS - 1] /
-					     count,
-				     &prefix);
+		avg = ns_to_siprefix((double)sum / count, &prefix);
 		fprintf(stream, "count: %llu, average: %.2f%ss\n", count, avg,
 			prefix);
 	} else {
@@ -903,8 +927,8 @@ static struct histogram_entry *
 lookup_or_zeroinit_hist(const struct hist_key *key,
 			struct histogram_buffer *buf)
 {
+	__u64 *current_buckets, *prev_buckets;
 	struct histogram_entry *hist;
-	__u64 *buckets;
 	int i;
 
 	hist = bsearch(key, buf->hists, buf->current_size, sizeof(*buf->hists),
@@ -918,25 +942,34 @@ lookup_or_zeroinit_hist(const struct hist_key *key,
 		return NULL;
 	}
 
-	buckets = calloc(HIST_NBUCKETS, sizeof(*buckets));
-	if (!buckets) {
+	current_buckets = calloc(HIST_NBUCKETS, sizeof(*current_buckets));
+	prev_buckets = calloc(HIST_NBUCKETS, sizeof(*prev_buckets));
+	if (!current_buckets || !prev_buckets) {
 		errno = ENOMEM;
-		return NULL;
+		goto err;
 	}
 
 	hist = &buf->hists[buf->current_size++];
 	memcpy(&hist->key, key, sizeof(hist->key));
 	hist->key.bucket = 0;
-	hist->buckets = buckets;
+	hist->current_buckets = current_buckets;
+	hist->prev_buckets = prev_buckets;
 
 	i = insert_last_hist_sorted(buf);
 	return &buf->hists[i];
+
+err:
+	free(current_buckets);
+	free(prev_buckets);
+	return NULL;
 }
 
 static void free_histentry(struct histogram_entry *hist)
 {
-	free(hist->buckets);
-	hist->buckets = NULL;
+	free(hist->current_buckets);
+	free(hist->prev_buckets);
+	hist->current_buckets = NULL;
+	hist->prev_buckets = NULL;
 }
 
 static int update_histogram_entry_bucket(const struct hist_key *key,
@@ -950,7 +983,7 @@ static int update_histogram_entry_bucket(const struct hist_key *key,
 	if (!hist)
 		return -errno;
 
-	hist->buckets[bucket] = count;
+	hist->current_buckets[bucket] = count;
 	return 0;
 }
 
