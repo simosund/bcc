@@ -74,6 +74,7 @@ struct env {
 	double report_interval_s;
 	bool has_enabled_hooks;
 	bool has_disabled_hooks;
+	bool translate_ifindex;
 	bool enabled_hooks[NETSTACKLAT_N_HOOKS];
 	int npids;
 	int nifindices;
@@ -615,12 +616,26 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		if (ret)
 			goto err_parse_arg;
 
-		if (lval < 0) // include all netns (no filtering)
+		// include all netns (no filtering)
+		if (lval < 0) {
 			env->bpf_conf.network_ns = 0;
-		else if (lval == 0) // use current netns
+			/*
+			 * Same ifindex can represent multiple interfaces in
+			 * different netns. Cannot accurately map ifindex to
+			 * an interface (and corresponding interface name).
+			 */
+			env->translate_ifindex = false;
+		// use current netns
+		} else if (lval == 0) {
 			; // keep initialized value
-		else
+		} else if (lval != env->bpf_conf.network_ns) {
 			env->bpf_conf.network_ns = lval;
+			/*
+			 * No simple way to get ifindex to interface name
+			 * in a different network namespace.
+			 */
+			env->translate_ifindex = false;
+		}
 		break;
 	case 'q': // min-queuelength
 		ret = parse_bounded_long(&lval, arg, 0, 65536,
@@ -675,6 +690,7 @@ static int parse_args(int argc, char *argv[], struct env *env)
 		return -current_netns;
 	}
 	env->bpf_conf.network_ns = current_netns;
+	env->translate_ifindex = true;
 
 	return -argp_parse(&argp, argc, argv, 0, NULL, env);
 }
@@ -796,12 +812,39 @@ static __u64 print_log2hist(FILE *stream, size_t n, const __u64 hist[n])
 	return count;
 }
 
-static void print_histkey(FILE *stream, const struct hist_key *key)
+static int format_ifindex(__u32 ifindex, bool translate_to_name, char *buf,
+			  size_t size)
 {
+	int len;
+
+	// just format as a number
+	if (!translate_to_name) {
+		len = snprintf(buf, size, "%u", ifindex);
+		return len < 0 ? -errno : len >= size ? -E2BIG : 0;
+	}
+
+	// translate to ifname
+	if (size < IF_NAMESIZE)
+		return -E2BIG;
+	if (!if_indextoname(ifindex, buf))
+		return -errno;
+
+	return 0;
+}
+
+static void print_histkey(FILE *stream, const struct hist_key *key,
+			  const struct env *env)
+{
+	char buf[128];
+
 	fprintf(stream, "%s", hook_to_str(key->hook));
 
-	if (key->ifindex)
-		fprintf(stream, ", interface=%u", key->ifindex);
+	if (key->ifindex) {
+		if (format_ifindex(key->ifindex, env->translate_ifindex, buf,
+				   sizeof(buf)) != 0)
+			snprintf(buf, sizeof(buf), "%u", key->ifindex);
+		fprintf(stream, ", interface=%s", buf);
+	}
 
 	if (key->cgroup)
 		fprintf(stream, ", cgroup=%llu", key->cgroup);
@@ -826,7 +869,8 @@ static __u64 diff_histentry(struct histogram_entry *entry, size_t n,
 	return count;
 }
 
-static void print_histentry(FILE *stream, struct histogram_entry *entry)
+static void print_histentry(FILE *stream, struct histogram_entry *entry,
+			    const struct env *env)
 {
 	__u64 diff[HIST_NBUCKETS - 1];
 	__u64 count, sum;
@@ -838,7 +882,7 @@ static void print_histentry(FILE *stream, struct histogram_entry *entry)
 	if (!count)
 		return;
 
-	print_histkey(stream, &entry->key);
+	print_histkey(stream, &entry->key, env);
 	fprintf(stream, ":\n");
 
 	print_log2hist(stream, ARRAY_SIZE(diff), diff);
@@ -1037,7 +1081,8 @@ exit:
 	return err ?: err2;
 }
 
-static int report_stats(const struct netstacklat_bpf *obj,
+static int report_stats(const struct env *env,
+			const struct netstacklat_bpf *obj,
 			struct histogram_buffer *hist_buf)
 {
 	int i, err;
@@ -1055,7 +1100,7 @@ static int report_stats(const struct netstacklat_bpf *obj,
 	printf("%s", ctime(&t));
 
 	for (i = 0; i < hist_buf->current_size; i++) {
-		print_histentry(stdout, &hist_buf->hists[i]);
+		print_histentry(stdout, &hist_buf->hists[i], env);
 	}
 	fflush(stdout);
 
@@ -1290,7 +1335,8 @@ static int setup_timer(__u64 interval_ns)
 	return fd;
 }
 
-static int handle_timer(int timer_fd, const struct netstacklat_bpf *obj,
+static int handle_timer(int timer_fd, const struct env *env,
+			const struct netstacklat_bpf *obj,
 			struct histogram_buffer *hist_buf)
 {
 	__u64 timer_exps;
@@ -1308,7 +1354,7 @@ static int handle_timer(int timer_fd, const struct netstacklat_bpf *obj,
 		fprintf(stderr, "Warning: Missed %llu reporting intervals\n",
 			timer_exps - 1);
 
-	return report_stats(obj, hist_buf);
+	return report_stats(env, obj, hist_buf);
 }
 
 static int epoll_add_event(int epoll_fd, int fd, __u64 event_type, __u64 value)
@@ -1348,7 +1394,8 @@ err:
 	return err;
 }
 
-static int poll_events(int epoll_fd, const struct netstacklat_bpf *obj,
+static int poll_events(int epoll_fd, const struct env *env,
+		       const struct netstacklat_bpf *obj,
 		       struct histogram_buffer *hist_buf)
 {
 	struct epoll_event events[MAX_EPOLL_EVENTS];
@@ -1368,7 +1415,7 @@ static int poll_events(int epoll_fd, const struct netstacklat_bpf *obj,
 			err = handle_signal(fd);
 			break;
 		case NETSTACKLAT_EPOLL_TIMER:
-			err = handle_timer(fd, obj, hist_buf);
+			err = handle_timer(fd, env, obj, hist_buf);
 			break;
 		default:
 			fprintf(stderr, "Warning: unexpected epoll data: %lu\n",
@@ -1503,12 +1550,12 @@ int main(int argc, char *argv[])
 
 	// Report stats until user shuts down program
 	while (true) {
-		err = poll_events(epoll_fd, obj, &hist_buf);
+		err = poll_events(epoll_fd, &env, obj, &hist_buf);
 
 		if (err) {
 			if (err == NETSTACKLAT_ABORT) {
 				// Report stats a final time before terminating
-				err = report_stats(obj, &hist_buf);
+				err = report_stats(&env, obj, &hist_buf);
 			} else {
 				libbpf_strerror(err, errmsg, sizeof(errmsg));
 				fprintf(stderr, "Failed polling fds: %s\n",
