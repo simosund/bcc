@@ -72,6 +72,7 @@ struct histogram_buffer {
 struct env {
 	struct netstacklat_bpf_config bpf_conf;
 	double report_interval_s;
+	char *cgroups_str;
 	bool has_enabled_hooks;
 	bool has_disabled_hooks;
 	bool translate_ifindex;
@@ -83,6 +84,8 @@ struct env {
 	__u32 ifindices[MAX_PARSED_IFACES];
 	__u64 cgroups[MAX_PARSED_CGROUPS];
 };
+
+static char cgroup_mount_path[PATH_MAX - 32] = "/sys/fs/cgroup";
 
 const char *argp_program_version = "netstacklat 0.1";
 const char *argp_program_bug_address =
@@ -110,6 +113,8 @@ static const struct argp_option opts[] = {
 	{ "include-hol-delay", 'y', NULL, 0,
 	  "include delays from reads that are head-of-line blocked (only for tcp-socket-read)",
 	  0 },
+	{ "cgroup-mount", 'm', "PATH", 0,
+	  "set the path to the cgroup mount (default /sys/fs/cgroup)", 0 },
 
 	{ "Probe points:", 0, NULL, OPTION_DOC, NULL, 0 },
 	{ "enable-probes", 'e', "PROBES", 0,
@@ -510,11 +515,20 @@ free_mem:
 
 static int parse_cgroup(const char *str, void *cgroupout)
 {
+	char full_cgroup_path[PATH_MAX];
+	int len, err = 0;
 	long long lval;
 	__u64 cgroup;
-	int err = 0;
 
-	cgroup = get_cgroup_id_from_path(str);
+	// assume relative path from cgroup_mount if not starting with /
+	len = snprintf(full_cgroup_path, sizeof(full_cgroup_path), "%s/%s",
+		       str[0] == '/' ? "" : cgroup_mount_path, str);
+	if (len < 0)
+		return -errno;
+	else if (len >= sizeof(full_cgroup_path))
+		return -E2BIG;
+
+	cgroup = get_cgroup_id_from_path(full_cgroup_path);
 
 	if (cgroup == 0) {
 		// Not a valid cgroup path - try parse it as an int instead
@@ -541,7 +555,9 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 	struct env *env = state->input;
 	long long lval;
 	double fval;
+	size_t size;
 	int i, ret;
+	char *buf;
 
 	switch (key) {
 	case 'r': // report-interval
@@ -554,6 +570,20 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		break;
 	case 'y': // include-hol-delay
 		env->bpf_conf.include_hol_blocked = true;
+		break;
+	case 'm': // cgroup-mount
+		if (arg[0] == '\0') {
+			argp_error(state, "%s must be non-empty",
+				   argp_name_from_key(key));
+			return EINVAL;
+		} else if (strlen(arg) >= sizeof(cgroup_mount_path)) {
+			argp_error(state, "%s \"%s\"too long",
+				   argp_name_from_key(key), arg);
+			return E2BIG;
+		}
+
+		strncpy(cgroup_mount_path, arg, sizeof(cgroup_mount_path) - 1);
+		cgroup_mount_path[sizeof(cgroup_mount_path) - 1] = '\0';
 		break;
 	case 'e': // enable-probes
 		if (env->has_disabled_hooks)
@@ -593,13 +623,32 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		env->bpf_conf.filter_pid = true;
 		break;
 	case 'c': // cgroups
-		ret = parse_cgroups(ARRAY_SIZE(env->cgroups) - env->ncgroups,
-				    env->cgroups + env->ncgroups, arg);
-		if (ret < 0)
-			goto err_parse_arg;
+		/*
+		 * Need to delay parsing cgroups until we can be certain that
+		 * any --cgroup-mount option has been processed. Save the
+		 * arguments to process later
+		 */
+		if (!env->cgroups_str) {
+			// first time --cgroup option is provided
+			env->cgroups_str = strdup(arg);
+			if (!env->cgroups_str) {
+				ret = errno;
+				goto err_alloc;
+			}
+		} else {
+			// cgroups have been provided previously - append
+			size = strlen(env->cgroups_str) + strlen(arg) + 2;
+			buf = malloc(size);
+			if (!buf) {
+				ret = errno;
+				goto err_alloc;
+			}
 
-		env->ncgroups += ret;
-		env->bpf_conf.filter_cgroup = true;
+			snprintf(buf, size, "%s,%s", env->cgroups_str, arg);
+			free(env->cgroups_str);
+			env->cgroups_str = buf;
+		}
+
 		break;
 	case 'i': // interfaces
 		ret = parse_ifaces(ARRAY_SIZE(env->ifindices) - env->nifindices,
@@ -651,6 +700,22 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 	case 'C': // groupby-cgroup
 		env->bpf_conf.groupby_cgroup = true;
 		break;
+	case ARGP_KEY_END:
+		if (env->cgroups_str) {
+			/* parse provided cgroups now that any cgroup-mount
+			   option must have been handled.
+			 */
+			ret = parse_cgroups(ARRAY_SIZE(env->cgroups),
+					    env->cgroups, env->cgroups_str);
+			if (ret < 0) {
+				key = 'c';
+				goto err_parse_arg;
+			}
+
+			env->ncgroups = ret;
+			env->bpf_conf.filter_cgroup = true;
+		}
+		break;
 	default:
 		return ARGP_ERR_UNKNOWN;
 	}
@@ -665,6 +730,11 @@ err_enable_and_disable_probes:
 	argp_error(state, "%s and %s are mutually exclusive, only use one\n",
 		   argp_name_from_key('e'), argp_name_from_key('d'));
 	return EEXIST;
+err_alloc:
+	// Not a user error - so don't use argp_error()
+	fprintf(stderr, "Failed to copy %s argument: %s\n",
+		argp_name_from_key(key), strerror(ret));
+	return ret;
 }
 
 static int parse_args(int argc, char *argv[], struct env *env)
