@@ -781,6 +781,20 @@ static int parse_args(int argc, char *argv[], struct env *env)
 	return -argp_parse(&argp, argc, argv, 0, NULL, env);
 }
 
+static void *insert_inorder(void *arr, void *elem, size_t size, size_t nmeb,
+			    int(compar)(const void *, const void *))
+{
+	char *last_pos = arr + (nmeb * size), *pos = last_pos;
+
+	while (pos > (char *)arr && compar(elem, pos - size) < 0)
+		pos -= size;
+
+	memmove(pos + size, pos, last_pos - pos);
+	memcpy(pos, elem, size);
+
+	return pos;
+}
+
 static int compare_cgroup_idpaths(const void *_id1, const void *_id2)
 {
 	const struct id_name *id1 = _id1, *id2 = _id2;
@@ -789,40 +803,58 @@ static int compare_cgroup_idpaths(const void *_id1, const void *_id2)
 	return id1->id < id2->id ? -1 : 1;
 }
 
-static struct id_name *lookup_cgroup_id(const struct cgroup_idpath_map *cgmap,
-					__u64 cgroup_id)
+static struct id_name *_lookup_cgroup_id(const struct cgroup_idpath_map *cgmap,
+					 __u64 cgroup_id)
 {
 	return bsearch(&cgroup_id, cgmap->idpath_map, cgmap->searcheable,
 		       sizeof(*cgmap->idpath_map), compare_cgroup_idpaths);
 }
 
-static int add_cgroup_idpath(struct cgroup_idpath_map *cgmap, __u64 cgroup_id,
-			     const char *cgroup_path)
+static void update_cgroup_idpath_map_searchable(struct cgroup_idpath_map *cgmap)
 {
-	struct id_name *cgroup;
+	if (cgmap->current_size > cgmap->searcheable)
+		qsort(cgmap->idpath_map, cgmap->current_size,
+		      sizeof(*cgmap->idpath_map), compare_cgroup_idpaths);
+	cgmap->searcheable = cgmap->current_size;
+}
+
+static int add_cgroup_idpath(struct cgroup_idpath_map *cgmap, __u64 cgroup_id,
+			     const char *cgroup_path, bool searchable)
+{
+	struct id_name cgroup;
 
 	if (cgmap->current_size >= cgmap->max_size)
 		return -ENOSPC;
 
-	cgroup = &cgmap->idpath_map[cgmap->current_size];
-	cgroup->id = cgroup_id;
-	cgroup->name = strdup(cgroup_path);
-	if (!cgroup->name)
+	cgroup.id = cgroup_id;
+	cgroup.name = strdup(cgroup_path);
+	if (!cgroup.name)
 		return -errno;
 
-	cgmap->current_size++;
+	if (searchable) {
+		update_cgroup_idpath_map_searchable(cgmap);
+		insert_inorder(cgmap->idpath_map, &cgroup, sizeof(cgroup),
+			       cgmap->current_size++, compare_cgroup_idpaths);
+		cgmap->searcheable++;
+	} else {
+		memcpy(&cgmap->idpath_map[cgmap->current_size++], &cgroup,
+		       sizeof(cgroup));
+	}
+
 	return 0;
 }
 
 static int update_cgroup_idpath(struct cgroup_idpath_map *cgmap,
-				__u64 cgroup_id, const char *cgroup_path)
+				__u64 cgroup_id, const char *cgroup_path,
+				bool searchable)
 {
 	struct id_name *cgroup;
 	char *newname;
 
-	cgroup = lookup_cgroup_id(cgmap, cgroup_id);
+	cgroup = _lookup_cgroup_id(cgmap, cgroup_id);
 	if (!cgroup)
-		return add_cgroup_idpath(cgmap, cgroup_id, cgroup_path);
+		return add_cgroup_idpath(cgmap, cgroup_id, cgroup_path,
+					 searchable);
 
 	// Update cgroup path for existing id-path mapping (if different)
 	if (strcmp(cgroup->name, cgroup_path) == 0)
@@ -836,14 +868,6 @@ static int update_cgroup_idpath(struct cgroup_idpath_map *cgmap,
 	cgroup->name = newname;
 
 	return 0;
-}
-
-static void update_cgroup_idpath_map_searchable(struct cgroup_idpath_map *cgmap)
-{
-	if (cgmap->current_size > cgmap->searcheable)
-		qsort(cgmap->idpath_map, cgmap->current_size,
-		      sizeof(*cgmap->idpath_map), compare_cgroup_idpaths);
-	cgmap->searcheable = cgmap->current_size;
 }
 
 static int update_cgroup_idpath_map(struct cgroup_idpath_map *cgmap)
@@ -891,7 +915,8 @@ static int update_cgroup_idpath_map(struct cgroup_idpath_map *cgmap)
 			}
 		}
 
-		err = update_cgroup_idpath(cgmap, cgroup_id, dir->fts_path);
+		err = update_cgroup_idpath(cgmap, cgroup_id, dir->fts_path,
+					   false);
 		if (err)
 			break;
 	}
@@ -901,6 +926,31 @@ static int update_cgroup_idpath_map(struct cgroup_idpath_map *cgmap)
 	fts_close(fts_tree);
 	update_cgroup_idpath_map_searchable(cgmap);
 	return err;
+}
+
+static struct id_name *lookup_cgroup_id(struct cgroup_idpath_map *cgmap,
+					__u64 cgroup_id, bool allow_rescan,
+					bool *did_rescan)
+{
+	struct id_name *cgroup;
+	int err;
+
+	cgroup = _lookup_cgroup_id(cgmap, cgroup_id);
+	if (cgroup || !allow_rescan) {
+		if (did_rescan)
+			*did_rescan = false;
+		return cgroup;
+	}
+
+	err = update_cgroup_idpath_map(cgmap);
+	if (err) {
+		errno = -err;
+		return NULL;
+	}
+
+	if (did_rescan)
+		*did_rescan = true;
+	return _lookup_cgroup_id(cgmap, cgroup_id);
 }
 
 static void free_cgroup_idpath(struct id_name *entry)
@@ -1081,23 +1131,27 @@ static int format_ifindex(__u32 ifindex, bool translate_to_name, char *buf,
 	return 0;
 }
 
-static int format_cgroup(__u64 cgroup_id, const struct cgroup_idpath_map *cgmap,
-			 char *buf, size_t size)
+static int format_cgroup(__u64 cgroup_id, struct cgroup_idpath_map *cgmap,
+			 bool *has_rescanned, char *buf, size_t size)
 {
 	struct id_name *cgroup;
 	int len;
 
-	cgroup = lookup_cgroup_id(cgmap, cgroup_id);
-	if (!cgroup)
+	cgroup = lookup_cgroup_id(cgmap, cgroup_id, !*has_rescanned,
+				  *has_rescanned ? NULL : has_rescanned);
+	if (!cgroup) {
 		len = snprintf(buf, size, "unknown (%llu)", cgroup_id);
-	else
+		if (len >= 0)
+			update_cgroup_idpath(cgmap, cgroup_id, buf, true);
+	} else {
 		len = snprintf(buf, size, "%s", cgroup->name);
+	}
 
 	return len < 0 ? -errno : len >= size ? -E2BIG : 0;
 }
 
 static void print_histkey(FILE *stream, const struct hist_key *key,
-			  const struct env *env)
+			  struct env *env, bool *has_rescanned)
 {
 	char buf[PATH_MAX];
 
@@ -1111,7 +1165,8 @@ static void print_histkey(FILE *stream, const struct hist_key *key,
 	}
 
 	if (key->cgroup) {
-		format_cgroup(key->cgroup, &env->cgroup_map, buf, sizeof(buf));
+		format_cgroup(key->cgroup, &env->cgroup_map, has_rescanned, buf,
+			      sizeof(buf));
 		fprintf(stream, ", cgroup=%s", buf);
 	}
 }
@@ -1136,7 +1191,7 @@ static __u64 diff_histentry(struct histogram_entry *entry, size_t n,
 }
 
 static void print_histentry(FILE *stream, struct histogram_entry *entry,
-			    const struct env *env)
+			    struct env *env, bool *has_rescanned)
 {
 	__u64 diff[HIST_NBUCKETS - 1];
 	__u64 count, sum;
@@ -1148,7 +1203,7 @@ static void print_histentry(FILE *stream, struct histogram_entry *entry,
 	if (!count)
 		return;
 
-	print_histkey(stream, &entry->key, env);
+	print_histkey(stream, &entry->key, env, has_rescanned);
 	fprintf(stream, ":\n");
 
 	print_log2hist(stream, ARRAY_SIZE(diff), diff);
@@ -1347,10 +1402,10 @@ exit:
 	return err ?: err2;
 }
 
-static int report_stats(const struct env *env,
-			const struct netstacklat_bpf *obj,
+static int report_stats(struct env *env, const struct netstacklat_bpf *obj,
 			struct histogram_buffer *hist_buf)
 {
+	bool has_rescanned = false;
 	int i, err;
 	time_t t;
 
@@ -1366,7 +1421,8 @@ static int report_stats(const struct env *env,
 	printf("%s", ctime(&t));
 
 	for (i = 0; i < hist_buf->current_size; i++) {
-		print_histentry(stdout, &hist_buf->hists[i], env);
+		print_histentry(stdout, &hist_buf->hists[i], env,
+				&has_rescanned);
 	}
 	fflush(stdout);
 
@@ -1601,7 +1657,7 @@ static int setup_timer(__u64 interval_ns)
 	return fd;
 }
 
-static int handle_timer(int timer_fd, const struct env *env,
+static int handle_timer(int timer_fd, struct env *env,
 			const struct netstacklat_bpf *obj,
 			struct histogram_buffer *hist_buf)
 {
@@ -1660,7 +1716,7 @@ err:
 	return err;
 }
 
-static int poll_events(int epoll_fd, const struct env *env,
+static int poll_events(int epoll_fd, struct env *env,
 		       const struct netstacklat_bpf *obj,
 		       struct histogram_buffer *hist_buf)
 {
