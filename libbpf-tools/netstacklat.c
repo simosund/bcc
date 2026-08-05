@@ -923,6 +923,12 @@ lookup_or_zeroinit_hist(const struct hist_key *key,
 	return &buf->hists[i];
 }
 
+static void free_histentry(struct histogram_entry *hist)
+{
+	free(hist->buckets);
+	hist->buckets = NULL;
+}
+
 static int update_histogram_entry_bucket(const struct hist_key *key,
 					 __u64 count,
 					 struct histogram_buffer *buf)
@@ -1065,6 +1071,15 @@ static int init_histogram_buffer(struct histogram_buffer *buf,
 	buf->max_size = max_hists;
 	buf->current_size = 0;
 	return 0;
+}
+
+static void free_histogram_buffer(struct histogram_buffer *buf)
+{
+	while (buf->current_size > 0)
+		free_histentry(&buf->hists[--buf->current_size]);
+
+	free(buf->hists);
+	buf->hists = NULL;
 }
 
 static int enable_sw_rx_tstamps(void)
@@ -1499,5 +1514,6 @@ exit_destroy_bpf:
 	netstacklat_bpf__destroy(obj);
 exit_sockfd:
 	close(sock_fd);
+	free_histogram_buffer(&hist_buf);
 	return err ? EXIT_FAILURE : EXIT_SUCCESS;
 }
