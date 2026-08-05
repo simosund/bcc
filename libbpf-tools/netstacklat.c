@@ -17,6 +17,7 @@
 #include <sys/socket.h>
 #include <sys/timex.h>
 #include <sys/stat.h>
+#include <fts.h>
 
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
@@ -49,6 +50,7 @@
 #define LOOKUP_BATCH_SIZE 128
 
 #define MAX_HOOK_PROGS 4
+#define MAX_CGROUP_PATH_MAPPINGS 65536
 
 typedef int (*t_parse_val_func)(const char *, void *);
 
@@ -69,6 +71,19 @@ struct histogram_buffer {
 	size_t current_size;
 };
 
+struct id_name {
+	__u64 id;
+	char *name;
+};
+
+struct cgroup_idpath_map {
+	char cgroup_path[PATH_MAX];
+	struct id_name *idpath_map;
+	size_t max_size; // max size of id_pathmap
+	size_t current_size; // current size of idpath_map
+	size_t searcheable; // subset of current_size that can be looked up
+};
+
 struct env {
 	struct netstacklat_bpf_config bpf_conf;
 	double report_interval_s;
@@ -83,6 +98,7 @@ struct env {
 	__u32 pids[MAX_PARSED_PIDS];
 	__u32 ifindices[MAX_PARSED_IFACES];
 	__u64 cgroups[MAX_PARSED_CGROUPS];
+	struct cgroup_idpath_map cgroup_map;
 };
 
 static char cgroup_mount_path[PATH_MAX - 32] = "/sys/fs/cgroup";
@@ -491,7 +507,8 @@ static unsigned long long get_cgroup_id_from_path(const char *cgroup_workdir)
 
 	err = name_to_handle_at(dirfd, cgroup_workdir, fhp, &mount_id, flags);
 	if (err >= 0 || fhp->handle_bytes != 8) {
-		errno = EBADE;
+		if (err >= 0 || errno == EOVERFLOW)
+			errno = EBADE;
 		goto free_mem;
 	}
 
@@ -582,8 +599,7 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 			return E2BIG;
 		}
 
-		strncpy(cgroup_mount_path, arg, sizeof(cgroup_mount_path) - 1);
-		cgroup_mount_path[sizeof(cgroup_mount_path) - 1] = '\0';
+		strcpy(cgroup_mount_path, arg);
 		break;
 	case 'e': // enable-probes
 		if (env->has_disabled_hooks)
@@ -765,6 +781,169 @@ static int parse_args(int argc, char *argv[], struct env *env)
 	return -argp_parse(&argp, argc, argv, 0, NULL, env);
 }
 
+static int compare_cgroup_idpaths(const void *_id1, const void *_id2)
+{
+	const struct id_name *id1 = _id1, *id2 = _id2;
+	if (id1->id == id2->id)
+		return 0;
+	return id1->id < id2->id ? -1 : 1;
+}
+
+static struct id_name *lookup_cgroup_id(const struct cgroup_idpath_map *cgmap,
+					__u64 cgroup_id)
+{
+	return bsearch(&cgroup_id, cgmap->idpath_map, cgmap->searcheable,
+		       sizeof(*cgmap->idpath_map), compare_cgroup_idpaths);
+}
+
+static int add_cgroup_idpath(struct cgroup_idpath_map *cgmap, __u64 cgroup_id,
+			     const char *cgroup_path)
+{
+	struct id_name *cgroup;
+
+	if (cgmap->current_size >= cgmap->max_size)
+		return -ENOSPC;
+
+	cgroup = &cgmap->idpath_map[cgmap->current_size];
+	cgroup->id = cgroup_id;
+	cgroup->name = strdup(cgroup_path);
+	if (!cgroup->name)
+		return -errno;
+
+	cgmap->current_size++;
+	return 0;
+}
+
+static int update_cgroup_idpath(struct cgroup_idpath_map *cgmap,
+				__u64 cgroup_id, const char *cgroup_path)
+{
+	struct id_name *cgroup;
+	char *newname;
+
+	cgroup = lookup_cgroup_id(cgmap, cgroup_id);
+	if (!cgroup)
+		return add_cgroup_idpath(cgmap, cgroup_id, cgroup_path);
+
+	// Update cgroup path for existing id-path mapping (if different)
+	if (strcmp(cgroup->name, cgroup_path) == 0)
+		return 0;
+
+	newname = strdup(cgroup_path);
+	if (!newname)
+		return -errno;
+
+	free(cgroup->name);
+	cgroup->name = newname;
+
+	return 0;
+}
+
+static void update_cgroup_idpath_map_searchable(struct cgroup_idpath_map *cgmap)
+{
+	if (cgmap->current_size > cgmap->searcheable)
+		qsort(cgmap->idpath_map, cgmap->current_size,
+		      sizeof(*cgmap->idpath_map), compare_cgroup_idpaths);
+	cgmap->searcheable = cgmap->current_size;
+}
+
+static int update_cgroup_idpath_map(struct cgroup_idpath_map *cgmap)
+{
+	char path_copy[sizeof(cgmap->cgroup_path)];
+	char *root_paths[] = { path_copy, NULL };
+	__u64 cgroup_id;
+	FTS *fts_tree;
+	FTSENT *dir;
+	int err = 0;
+
+	/*
+	 * fts_open() does not garantuee that it won't modify the path.
+	 * So need to copy the path argument.
+	 * https://stackoverflow.com/a/65845045
+	 */
+	strncpy(path_copy, cgmap->cgroup_path, sizeof(path_copy));
+	path_copy[sizeof(path_copy) - 1] = '\0';
+
+	fts_tree = fts_open(root_paths, FTS_LOGICAL | FTS_NOSTAT, NULL);
+	if (!fts_tree)
+		return -errno;
+
+	errno = 0;
+	while ((dir = fts_read(fts_tree))) {
+		if (dir->fts_info == FTS_ERR) {
+			err = -dir->fts_errno;
+			break;
+		} else if (dir->fts_info != FTS_D)
+			continue;
+
+		cgroup_id = get_cgroup_id_from_path(dir->fts_path);
+		if (!cgroup_id) {
+			if (errno == ENOENT) {
+				/*
+				 * Probably a cgroup that got deleted before
+				 * we could get its ID.
+				 * Ignore and move on.
+				 */
+				errno = 0;
+				continue;
+			} else {
+				err = -errno;
+				break;
+			}
+		}
+
+		err = update_cgroup_idpath(cgmap, cgroup_id, dir->fts_path);
+		if (err)
+			break;
+	}
+	// catch potential errno from fts_read()
+	err = err ?: -errno;
+
+	fts_close(fts_tree);
+	update_cgroup_idpath_map_searchable(cgmap);
+	return err;
+}
+
+static void free_cgroup_idpath(struct id_name *entry)
+{
+	free(entry->name);
+	entry->name = NULL;
+}
+
+static void free_cgroup_idpath_map(struct cgroup_idpath_map *cgmap)
+{
+	while (cgmap->current_size > 0)
+		free_cgroup_idpath(&cgmap->idpath_map[--cgmap->current_size]);
+
+	cgmap->searcheable = 0;
+	free(cgmap->idpath_map);
+	cgmap->idpath_map = NULL;
+}
+
+static int init_cgroup_idpath_map(struct cgroup_idpath_map *cgmap,
+				  size_t max_size, const char *cgroup_path)
+{
+	int err;
+
+	memset(cgmap, 0, sizeof(*cgmap));
+	cgmap->max_size = max_size;
+
+	if (strlen(cgroup_path) >= sizeof(cgmap->cgroup_path))
+		return -E2BIG;
+	strcpy(cgmap->cgroup_path, cgroup_path);
+
+	cgmap->idpath_map = calloc(max_size, sizeof(*cgmap->idpath_map));
+	if (!cgmap->idpath_map)
+		return -errno;
+
+	err = update_cgroup_idpath_map(cgmap);
+	if (err) {
+		free_cgroup_idpath_map(cgmap);
+		return err;
+	}
+
+	return 0;
+}
+
 static int find_first_nonzero_bucket(size_t n, const __u64 hist[n])
 {
 	int i;
@@ -902,10 +1081,25 @@ static int format_ifindex(__u32 ifindex, bool translate_to_name, char *buf,
 	return 0;
 }
 
+static int format_cgroup(__u64 cgroup_id, const struct cgroup_idpath_map *cgmap,
+			 char *buf, size_t size)
+{
+	struct id_name *cgroup;
+	int len;
+
+	cgroup = lookup_cgroup_id(cgmap, cgroup_id);
+	if (!cgroup)
+		len = snprintf(buf, size, "unknown (%llu)", cgroup_id);
+	else
+		len = snprintf(buf, size, "%s", cgroup->name);
+
+	return len < 0 ? -errno : len >= size ? -E2BIG : 0;
+}
+
 static void print_histkey(FILE *stream, const struct hist_key *key,
 			  const struct env *env)
 {
-	char buf[128];
+	char buf[PATH_MAX];
 
 	fprintf(stream, "%s", hook_to_str(key->hook));
 
@@ -916,8 +1110,10 @@ static void print_histkey(FILE *stream, const struct hist_key *key,
 		fprintf(stream, ", interface=%s", buf);
 	}
 
-	if (key->cgroup)
-		fprintf(stream, ", cgroup=%llu", key->cgroup);
+	if (key->cgroup) {
+		format_cgroup(key->cgroup, &env->cgroup_map, buf, sizeof(buf));
+		fprintf(stream, ", cgroup=%s", buf);
+	}
 }
 
 static __u64 diff_histentry(struct histogram_entry *entry, size_t n,
@@ -1522,6 +1718,17 @@ int main(int argc, char *argv[])
 		return EXIT_FAILURE;
 	}
 
+	if (env.bpf_conf.groupby_cgroup) {
+		err = init_cgroup_idpath_map(&env.cgroup_map,
+					   MAX_CGROUP_PATH_MAPPINGS,
+					   cgroup_mount_path);
+		if (err) {
+			fprintf(stderr, "Failed scanning cgroups at %s: %s\n",
+				cgroup_mount_path, strerror(-err));
+			return EXIT_FAILURE;
+		}
+	}
+
 	sock_fd = enable_sw_rx_tstamps();
 	if (sock_fd < 0) {
 		err = sock_fd;
@@ -1647,6 +1854,7 @@ exit_destroy_bpf:
 	netstacklat_bpf__destroy(obj);
 exit_sockfd:
 	close(sock_fd);
+	free_cgroup_idpath_map(&env.cgroup_map);
 	free_histogram_buffer(&hist_buf);
 	return err ? EXIT_FAILURE : EXIT_SUCCESS;
 }
