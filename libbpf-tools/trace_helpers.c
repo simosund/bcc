@@ -948,9 +948,18 @@ static void print_stars(unsigned int val, unsigned int val_max, int width)
 		printf("+");
 }
 
-void print_log2_hist(unsigned int *vals, int vals_size, const char *val_type)
+static void format_integer_default(char *buf, size_t size,
+				   unsigned long long val)
+{
+	snprintf(buf, size, "%llu", val);
+}
+
+void print_log2_hist_opt(unsigned int *vals, int vals_size,
+			 const char *val_type, bool le,
+			 integer_formatter formatter)
 {
 	int stars_max = 40, idx_min = -1, idx_max = -1;
+	char low_str[24], high_str[24];
 	unsigned int val, val_max = 0;
 	unsigned long long low, high;
 	int stars, width, i;
@@ -970,24 +979,53 @@ void print_log2_hist(unsigned int *vals, int vals_size, const char *val_type)
 		return;
 
 	printf("%*s%-*s : count    distribution\n", idx_max <= 32 ? 5 : 15, "",
-		idx_max <= 32 ? 19 : 29, val_type);
+	       idx_max <= 32 ? 19 : 29, val_type);
 
 	if (idx_max <= 32)
 		stars = stars_max;
 	else
 		stars = stars_max / 2;
 
+	formatter = formatter ?: format_integer_default;
+
 	for (i = idx_min; i <= idx_max; i++) {
-		low = (1ULL << (i + 1)) >> 1;
-		high = (1ULL << (i + 1)) - 1;
-		if (low == high)
-			low -= 1;
-		val = vals[i];
+		if (le) {
+			/*
+			 * le (less-than-or-equal) bins format used by e.g.
+			 * Prometheus/ebpf_exporter.
+			 * Bin index is obtained from ceil(log2(val)), which
+			 * gives right-closed bins of the format
+			 * (2^(i - 1), 2^i]
+			 */
+			low = i < 1 ? 0 : (1ULL << (i - 1)) + 1;
+			high = 1ULL << i;
+		} else {
+			/*
+			 * Regular log2 bin format.
+			 * Bin index is obtained from floor(log2(val)), which
+			 * gives left-closed bins of the format [2^i, 2^(i+1))
+			 */
+			low = (1ULL << (i + 1)) >> 1;
+			high = (1ULL << (i + 1)) - 1;
+
+			if (low == high)
+				low -= 1;
+		}
+
 		width = idx_max <= 32 ? 10 : 20;
-		printf("%*lld -> %-*lld : %-8d |", width, low, width, high, val);
+		formatter(low_str, width + 1, low);
+		formatter(high_str, width + 1, high);
+		val = vals[i];
+		printf("%*s -> %-*s : %-8d |", width, low_str, width, high_str,
+		       val);
 		print_stars(val, val_max, stars);
 		printf("|\n");
 	}
+}
+
+void print_log2_hist(unsigned int *vals, int vals_size, const char *val_type)
+{
+	print_log2_hist_opt(vals, vals_size, val_type, false, NULL);
 }
 
 void print_linear_hist(unsigned int *vals, int vals_size, unsigned int base,
