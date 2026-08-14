@@ -1242,38 +1242,12 @@ static int cmp_histentry(const void *val1, const void *val2)
 	return cmp_histkey(&entry1->key, &entry2->key);
 }
 
-static int insert_last_hist_sorted(struct histogram_buffer *buf)
-{
-	struct histogram_entry *hists = buf->hists;
-	int i, last = buf->current_size - 1;
-	struct histogram_entry tmp;
-
-	if (buf->current_size < 2)
-		return 0;
-
-	i = last;
-	while (i > 0 && cmp_histentry(&hists[last], &hists[i - 1]) < 0)
-		i--;
-
-	if (i == last)
-		// Last hist already in the right place, no need to swap it in
-		return i;
-
-	// Swap in hist to the correct position
-	memcpy(&tmp, &hists[last], sizeof(tmp));
-	memmove(&hists[i + 1], &hists[i], (last - i) * sizeof(*hists));
-	memcpy(&hists[i], &tmp, sizeof(*hists));
-
-	return i;
-}
-
 static struct histogram_entry *
 lookup_or_zeroinit_hist(const struct hist_key *key,
 			struct histogram_buffer *buf)
 {
+	struct histogram_entry new_hist, *hist;
 	__u64 *current_buckets, *prev_buckets;
-	struct histogram_entry *hist;
-	int i;
 
 	hist = bsearch(key, buf->hists, buf->current_size, sizeof(*buf->hists),
 		       cmp_histentry);
@@ -1293,15 +1267,13 @@ lookup_or_zeroinit_hist(const struct hist_key *key,
 		goto err;
 	}
 
-	hist = &buf->hists[buf->current_size++];
-	memcpy(&hist->key, key, sizeof(hist->key));
-	hist->key.bucket = 0;
-	hist->current_buckets = current_buckets;
-	hist->prev_buckets = prev_buckets;
+	memcpy(&new_hist.key, key, sizeof(hist->key));
+	new_hist.key.bucket = 0;
+	new_hist.current_buckets = current_buckets;
+	new_hist.prev_buckets = prev_buckets;
 
-	i = insert_last_hist_sorted(buf);
-	return &buf->hists[i];
-
+	return insert_inorder(buf->hists, &new_hist, sizeof(new_hist),
+			      buf->current_size++, cmp_histentry);
 err:
 	free(current_buckets);
 	free(prev_buckets);
