@@ -1019,6 +1019,17 @@ static void format_nanosecond_delay(char *buf, size_t size,
 	snprintf(buf, size, "%.3g%ss", sival, prefix);
 }
 
+/*
+ * Get the left edge of a log2-le (less-than-or-equal) histogram bin.
+ *
+ * In an log2-le hist, the bin index is obtained from ceil(log2(val)), which
+ * gives right-closed bins of the format (2^(i - 1), 2^i].
+ */
+unsigned long long log2_le_bin_edge(size_t bin, void *ctx)
+{
+	return bin < 1 ? 0 : (1ULL << (bin - 1)) + 1;
+}
+
 static int format_ifindex(__u32 ifindex, bool translate_to_name, char *buf,
 			  size_t size)
 {
@@ -1114,8 +1125,8 @@ static void print_histentry(struct histogram_entry *entry, struct env *env,
 	print_histkey(&entry->key, env, has_rescanned);
 	printf(":\n");
 
-	print_log2_hist_opt(diff, ARRAY_SIZE(diff), "delay", true,
-			    format_nanosecond_delay);
+	print_hist(diff, ARRAY_SIZE(diff), "delay", log2_le_bin_edge, NULL,
+		   format_nanosecond_delay, false);
 
 	// Final "bucket" is the sum of all values in the histogram
 	if (count > 0) {
