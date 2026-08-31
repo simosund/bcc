@@ -12,7 +12,6 @@ LIBBLAZESYM_INC := $(abspath $(LIBBLAZESYM_SRC)/capi/include)
 LIBBLAZESYM_OBJ := $(abspath $(OUTPUT)/libblazesym_c.a)
 INCLUDES := -I$(OUTPUT) -I../src/cc/libbpf/include/uapi
 CFLAGS := -g -O2 -Wall -Wmissing-field-initializers -Werror -Werror=undef
-LDFLAGS := -lm
 BPFCFLAGS := -g -O2 -Wall -Werror=undef
 BPFCFLAGS_softirqs := $(BPFCFLAGS) -mcpu=v3
 INSTALL ?= install

@@ -6,7 +6,6 @@
 #include <errno.h>
 #include <signal.h>
 #include <time.h>
-#include <math.h>
 #include <argp.h>
 #include <ctype.h>
 #include <fcntl.h>
@@ -26,6 +25,7 @@
 
 #include "netstacklat.h"
 #include "netstacklat.skel.h"
+#include "trace_helpers.h"
 
 #define MAX_EPOLL_EVENTS 8
 
@@ -994,44 +994,7 @@ static int init_cgroup_idpath_map(struct cgroup_idpath_map *cgmap,
 	return 0;
 }
 
-static int find_first_nonzero_bucket(size_t n, const __u64 hist[n])
-{
-	int i;
-
-	for (i = 0; i < n; i++) {
-		if (hist[i] > 0)
-			return i;
-	}
-
-	return -1;
-}
-
-static int find_last_nonzero_bucket(size_t n, const __u64 hist[n])
-{
-	int i;
-
-	for (i = n - 1; i >= 0; i--) {
-		if (hist[i] > 0)
-			return i;
-	}
-
-	return -1;
-}
-
-static int find_largest_bucket(size_t n, const __u64 hist[n])
-{
-	__u64 max_val = 0;
-	int i;
-
-	for (i = 0; i < n; i++) {
-		if (hist[i] > max_val)
-			max_val = hist[i];
-	}
-
-	return max_val;
-}
-
-static double ns_to_siprefix(double ns, char **prefix)
+static double ns_to_siprefix(double ns, const char **prefix)
 {
 	static char *prefixes[] = { "n", "u", "m", "" };
 	int psteps = 0;
@@ -1046,69 +1009,14 @@ static double ns_to_siprefix(double ns, char **prefix)
 	return ns;
 }
 
-static void print_nchars(FILE *stream, char c, int n)
+static void format_nanosecond_delay(char *buf, size_t size,
+				    unsigned long long delay)
 {
-	while (n-- > 0)
-		putc(c, stream);
-}
+	const char *prefix;
+	double sival;
 
-static int print_bucket_interval(FILE *stream, double low_bound_ns,
-				 double high_bound_ns)
-{
-	char *lprefix, *hprefix;
-	double low_si, high_si;
-
-	low_si = ns_to_siprefix(low_bound_ns, &lprefix);
-
-	if (isinf(high_bound_ns)) {
-		high_si = INFINITY;
-		hprefix = " ";
-	} else {
-		high_si = ns_to_siprefix(high_bound_ns, &hprefix);
-	}
-
-	return fprintf(stream, "%c%.3g%ss, %.3g%ss]",
-		       low_bound_ns == 0 ? '[' : '(', low_si, lprefix, high_si,
-		       hprefix);
-}
-
-static void print_histbar(FILE *stream, __u64 count, __u64 max_count)
-{
-	int barlen = round((double)count / max_count * MAX_BAR_STRLEN);
-
-	fprintf(stream, "|");
-	print_nchars(stream, '@', barlen);
-	print_nchars(stream, ' ', MAX_BAR_STRLEN - barlen);
-	fprintf(stream, "|");
-}
-
-static __u64 print_log2hist(FILE *stream, size_t n, const __u64 hist[n])
-{
-	int bucket, start_bucket, end_bucket, max_bucket, len;
-	double low_bound, high_bound;
-	__u64 count = 0;
-
-	start_bucket = find_first_nonzero_bucket(n, hist);
-	end_bucket = find_last_nonzero_bucket(n, hist);
-	max_bucket = find_largest_bucket(n, hist);
-
-	for (bucket = max(0, start_bucket); bucket <= end_bucket; bucket++) {
-		// First bucket includes 0 (i.e. [0, 1] rather than (0.5, 1])
-		low_bound = bucket > 0 ? 1ULL << (bucket - 1) : 0;
-		// Last bucket includes all values too large for the second-last bucket
-		high_bound = bucket < n - 1 ? 1ULL << bucket : INFINITY;
-
-		len = print_bucket_interval(stream, low_bound, high_bound);
-		print_nchars(stream, ' ',
-			     max(0, MAX_BUCKETSPAN_STRLEN - len) + 1);
-		fprintf(stream, "%*llu ", MAX_BUCKETCOUNT_STRLEN, hist[bucket]);
-		print_histbar(stream, hist[bucket], max_bucket);
-		fprintf(stream, "\n");
-
-		count += hist[bucket];
-	}
-
-	return count;
+	sival = ns_to_siprefix(delay, &prefix);
+	snprintf(buf, size, "%.3g%ss", sival, prefix);
 }
 
 static int format_ifindex(__u32 ifindex, bool translate_to_name, char *buf,
@@ -1150,29 +1058,29 @@ static int format_cgroup(__u64 cgroup_id, struct cgroup_idpath_map *cgmap,
 	return len < 0 ? -errno : len >= size ? -E2BIG : 0;
 }
 
-static void print_histkey(FILE *stream, const struct hist_key *key,
-			  struct env *env, bool *has_rescanned)
+static void print_histkey(const struct hist_key *key, struct env *env,
+			  bool *has_rescanned)
 {
 	char buf[PATH_MAX];
 
-	fprintf(stream, "%s", hook_to_str(key->hook));
+	printf("%s", hook_to_str(key->hook));
 
 	if (key->ifindex) {
 		if (format_ifindex(key->ifindex, env->translate_ifindex, buf,
 				   sizeof(buf)) != 0)
 			snprintf(buf, sizeof(buf), "%u", key->ifindex);
-		fprintf(stream, ", interface=%s", buf);
+		printf(", interface=%s", buf);
 	}
 
 	if (key->cgroup) {
 		format_cgroup(key->cgroup, &env->cgroup_map, has_rescanned, buf,
 			      sizeof(buf));
-		fprintf(stream, ", cgroup=%s", buf);
+		printf(", cgroup=%s", buf);
 	}
 }
 
 static __u64 diff_histentry(struct histogram_entry *entry, size_t n,
-			    __u64 diff[n - 1], __u64 *sum)
+			    __u32 diff[n - 1], __u64 *sum)
 {
 	__u64 count = 0;
 	int i;
@@ -1190,12 +1098,12 @@ static __u64 diff_histentry(struct histogram_entry *entry, size_t n,
 	return count;
 }
 
-static void print_histentry(FILE *stream, struct histogram_entry *entry,
-			    struct env *env, bool *has_rescanned)
+static void print_histentry(struct histogram_entry *entry, struct env *env,
+			    bool *has_rescanned)
 {
-	__u64 diff[HIST_NBUCKETS - 1];
+	__u32 diff[HIST_NBUCKETS - 1];
+	const char *prefix;
 	__u64 count, sum;
-	char *prefix;
 	double avg;
 
 	count = diff_histentry(entry, HIST_NBUCKETS, diff, &sum);
@@ -1203,20 +1111,20 @@ static void print_histentry(FILE *stream, struct histogram_entry *entry,
 	if (!count)
 		return;
 
-	print_histkey(stream, &entry->key, env, has_rescanned);
-	fprintf(stream, ":\n");
+	print_histkey(&entry->key, env, has_rescanned);
+	printf(":\n");
 
-	print_log2hist(stream, ARRAY_SIZE(diff), diff);
+	print_log2_hist_opt(diff, ARRAY_SIZE(diff), "delay", true,
+			    format_nanosecond_delay);
 
 	// Final "bucket" is the sum of all values in the histogram
 	if (count > 0) {
 		avg = ns_to_siprefix((double)sum / count, &prefix);
-		fprintf(stream, "count: %llu, average: %.2f%ss\n", count, avg,
-			prefix);
+		printf("count: %llu, average: %.2f%ss\n", count, avg, prefix);
 	} else {
-		fprintf(stream, "count: %llu, average: -\n", count);
+		printf("count: %llu, average: -\n", count);
 	}
-	fprintf(stream, "\n");
+	printf("\n");
 }
 
 static int cmp_histkey(const void *val1, const void *val2)
@@ -1393,8 +1301,7 @@ static int report_stats(struct env *env, const struct netstacklat_bpf *obj,
 	printf("%s", ctime(&t));
 
 	for (i = 0; i < hist_buf->current_size; i++) {
-		print_histentry(stdout, &hist_buf->hists[i], env,
-				&has_rescanned);
+		print_histentry(&hist_buf->hists[i], env, &has_rescanned);
 	}
 	fflush(stdout);
 
