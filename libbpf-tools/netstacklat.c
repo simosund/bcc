@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <errno.h>
+#include <math.h>
 #include <signal.h>
 #include <time.h>
 #include <argp.h>
@@ -321,7 +322,7 @@ static int parse_bounded_double(double *res, const char *str, double low,
 		return -ERANGE;
 	}
 
-	if (*res < low || *res > high) {
+	if (*res < low || *res > high || !isfinite(*res)) {
 		fprintf(stderr, "%s must be in range [%g, %g]\n", name, low, high);
 		return -ERANGE;
 	}
