@@ -1496,9 +1496,8 @@ static int init_signalfd(void)
 
 	err = pthread_sigmask(SIG_BLOCK, &mask, NULL);
 	if (err) {
-		err = -errno;
 		close(fd);
-		return err;
+		return -err;
 	}
 
 	return fd;
