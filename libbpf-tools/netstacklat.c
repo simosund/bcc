@@ -1214,6 +1214,9 @@ static int update_histogram_entry_bucket(const struct hist_key *key,
 	struct histogram_entry *hist;
 	int bucket = key->bucket;
 
+	if (bucket >= HIST_NBUCKETS)
+		return -ERANGE;
+
 	hist = lookup_or_zeroinit_hist(key, buf);
 	if (!hist)
 		return -errno;
