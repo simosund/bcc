@@ -1397,20 +1397,72 @@ static __s64 get_tai_offset(void)
 	return ntpt.tai;
 }
 
-static void set_programs_to_load(const struct env *env,
-				 struct netstacklat_bpf *obj)
+static const char *bpf_program__function_name(const struct bpf_program *prog)
+{
+	const char *sec = bpf_program__section_name(prog);
+	int i;
+
+	if (!sec || strlen(sec) == 0)
+		return NULL;
+
+	for (i = strlen(sec) - 1; i > 0; i--)
+		if (sec[i] == '/')
+			return &sec[i + 1];
+
+	return sec;
+}
+
+static int set_program_loadable(struct netstacklat_bpf *obj,
+				struct bpf_program *prog, bool try_load)
+{
+	if (try_load &&
+	    !fentry_can_attach(bpf_program__function_name(prog), NULL)) {
+		/*
+		 * Some netstacklat probes have both IPv4 and IPv6 paths.
+		 * On kernels lacking IPv6 support, it is ok to just disable
+		 * the IPv6 path and rely on just the IPv4 path. However,
+		 * if non-IPv6 functions cannot be attached to, the
+		 * netstacklat hook point will not function properly.
+		 */
+		if (prog != obj->progs.netstacklat_ip6_rcv_core &&
+		    prog != obj->progs.netstacklat_tcp_v6_rcv &&
+		    prog != obj->progs.netstacklat_udpv6_rcv)
+			return -ESRCH;
+
+		try_load = false;
+	}
+
+	bpf_program__set_autoload(prog, try_load);
+	return 0;
+}
+
+static int set_programs_to_load(const struct env *env,
+				struct netstacklat_bpf *obj)
 {
 	struct hook_prog_collection progs;
 	enum netstacklat_hook hook;
-	int i;
+	struct bpf_program *prog;
+	int i, err;
 
 	for (hook = 1; hook < NETSTACKLAT_N_HOOKS; hook++) {
 		hook_to_progs(&progs, hook, obj);
 
-		for (i = 0; i < progs.nprogs; i++)
-			bpf_program__set_autoload(progs.progs[i],
-						  env->enabled_hooks[hook]);
+		for (i = 0; i < progs.nprogs; i++) {
+			prog = progs.progs[i];
+
+			err = set_program_loadable(obj, prog,
+						   env->enabled_hooks[hook]);
+			if (err) {
+				fprintf(stderr,
+					"Cannot attach program to %s, probe %s not supported\n",
+					bpf_program__section_name(prog),
+					hook_to_str(hook));
+				return err;
+			}
+		}
 	}
+
+	return 0;
 }
 
 static int set_map_sizes(const struct env *env,
@@ -1698,7 +1750,12 @@ int main(int argc, char *argv[])
 	obj->rodata->TAI_OFFSET = get_tai_offset() * NS_PER_S;
 	obj->rodata->user_config = env.bpf_conf;
 
-	set_programs_to_load(&env, obj);
+	err = set_programs_to_load(&env, obj);
+	if (err) {
+		fprintf(stderr, "Failed configuring programs to load: %s\n",
+			strerror(-err));
+		goto exit_destroy_bpf;
+	}
 
 	err = set_map_sizes(&env, obj, hist_buf.max_size);
 	if (err) {
