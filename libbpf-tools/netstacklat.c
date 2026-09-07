@@ -1554,10 +1554,10 @@ static int init_signalfd(void)
 	if (fd < 0)
 		return -errno;
 
-	err = pthread_sigmask(SIG_BLOCK, &mask, NULL);
-	if (err) {
+	if (sigprocmask(SIG_BLOCK, &mask, NULL)) {
+		err = -errno;
 		close(fd);
-		return -err;
+		return err;
 	}
 
 	return fd;
