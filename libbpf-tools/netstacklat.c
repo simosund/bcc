@@ -446,18 +446,14 @@ static int parse_pids(size_t size, __u32 arr[size], const char *str)
 
 static int parse_iface(const char *str, void *ifindexout)
 {
-	int ifindex, err = 0;
 	long long lval;
+	__u32 ifindex;
+	int err = 0;
 
 	ifindex = if_nametoindex(str);
-	if (ifindex > IFINDEX_MAX) {
-		fprintf(stderr,
-			"%s has ifindex %d which is above the supported limit %d\n",
-			str, ifindex, IFINDEX_MAX);
-		return -ENOTSUP;
-	} else if (ifindex == 0) {
+	if (ifindex == 0) {
 		// Not a valid interface name - try parsing it as an index instead
-		err = parse_bounded_long(&lval, str, 1, IFINDEX_MAX,
+		err = parse_bounded_long(&lval, str, 1, UINT32_MAX,
 					 "interface");
 		if (!err)
 			ifindex = lval;
@@ -1492,15 +1488,26 @@ static int set_map_sizes(const struct env *env,
 		return err;
 	}
 
-	// ifindex filter - arraymap, needs max ifindex + 1 entries
+	/*
+	 * ifindex filter - arraymap if max ifindex is low, otherwise hash.
+	 * For array needs max ifindex + 1 entries. If max ifindex (up to
+	 * UINT32_MAX) is too high to reasonably allocate an array to fit
+	 * it, fallback to a slower hashmap.
+	 */
 	for (i = 0, size = 1; i < env->nifindices; i++) {
 		if (env->ifindices[i] >= size)
 			size = env->ifindices[i] + 1;
 	}
-	err = bpf_map__set_max_entries(obj->maps.netstack_ifindexfilter, size);
+
+	if (size > IFINDEX_MAX_MAP_SIZE)
+		err = bpf_map__set_type(obj->maps.netstack_ifindexfilter,
+					BPF_MAP_TYPE_HASH);
+	else
+		err = bpf_map__set_max_entries(obj->maps.netstack_ifindexfilter,
+					       size);
 	if (err) {
 		fprintf(stderr,
-			"Failed setting size of ifindex filter map to %u\n",
+			"Failed sizing ifindex map to support ifindices up to %u\n",
 			size);
 		return err;
 	}

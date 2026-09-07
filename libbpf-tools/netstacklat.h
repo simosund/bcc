@@ -15,8 +15,8 @@
 
 // The highest possible PID on a Linux system (from /include/linux/threads.h)
 #define PID_MAX_LIMIT (4 * 1024 * 1024)
-// The highest ifindex we expect to encounter
-#define IFINDEX_MAX 16384
+// The maximum number of entries in the ifindex filter map
+#define IFINDEX_MAX_MAP_SIZE 65536
 
 // Maximum number of PIDs/ifaces/cgroups to read from the user and filter for
 #define MAX_PARSED_PIDS 4096

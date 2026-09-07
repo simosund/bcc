@@ -52,7 +52,7 @@ struct {
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(max_entries, IFINDEX_MAX + 1);
+	__uint(max_entries, IFINDEX_MAX_MAP_SIZE);
 	__type(key, u32);
 	__type(value, u64);
 } netstack_ifindexfilter SEC(".maps");
