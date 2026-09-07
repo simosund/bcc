@@ -546,7 +546,7 @@ static int parse_cgroup(const char *str, void *cgroupout)
 
 	if (cgroup == 0) {
 		// Not a valid cgroup path - try parse it as an int instead
-		err = parse_bounded_long(&lval, str, 0, INT64_MAX, "cgroup");
+		err = parse_bounded_long(&lval, str, 1, INT64_MAX, "cgroup");
 		if (!err)
 			cgroup = lval;
 	}
