@@ -8,6 +8,7 @@
 #include "netstacklat.h"
 #include "bits.bpf.h"
 #include "maps.bpf.h"
+#include "core_fixes.bpf.h"
 
 // Mimic macros from /include/net/tcp.h
 #define tcp_sk(ptr) container_of(ptr, struct tcp_sock, inet_conn.icsk_inet.sk)
@@ -27,19 +28,6 @@ volatile const struct netstacklat_bpf_config user_config = {
 	.groupby_cgroup = false,
 	.include_hol_blocked = false,
 };
-
-/*
- * Alternative definition of sk_buff to handle renaming of the field
- * mono_delivery_time to tstamp_type. See
- * https://nakryiko.com/posts/bpf-core-reference-guide/#handling-incompatible-field-and-type-changes
- */
-struct sk_buff___old {
-	union {
-		ktime_t tstamp;
-		u64 skb_mstamp_ns;
-	};
-	__u8 mono_delivery_time : 1;
-} __attribute__((preserve_access_index));
 
 struct tcp_sock_ooo_range {
 	u32 prev_n_ooopkts;
@@ -216,28 +204,9 @@ static void record_skb_latency(struct sk_buff *skb, struct sock *sk,
 {
 	struct hist_key key = { .hook = hook };
 
-	if (bpf_core_field_exists(skb->tstamp_type)) {
-		/*
-		 * For kernels >= v6.11 the tstamp_type being non-zero
-		 * (SKB_CLOCK_REALTIME) implies that skb->tstamp holds a
-		 * preserved TX timestamp rather than a RX timestamp. See
-		 * https://lore.kernel.org/all/20240509211834.3235191-2-quic_abchauha@quicinc.com/
-		 */
-		if (BPF_CORE_READ_BITFIELD(skb, tstamp_type) > 0)
-			return;
-
-	} else {
-		/*
-		 * For kernels < v6.11, the field was called mono_delivery_time
-		 * instead, see https://lore.kernel.org/all/20220302195525.3480280-1-kafai@fb.com/
-		 * Kernels < v5.18 do not have the mono_delivery_field either,
-		 * but we do not support those anyways (as they lack the
-		 * bpf_ktime_get_tai_ns helper)
-		 */
-		struct sk_buff___old *skb_old = (void *)skb;
-		if (BPF_CORE_READ_BITFIELD(skb_old, mono_delivery_time) > 0)
-			return;
-	}
+        if (skb_non_realtime_tstamp(skb))
+                /* skb->tstamp is preserved delivery tstamp, not rcv tstamp */
+                return;
 
 	if (!filter_network(skb, sk))
 		return;
