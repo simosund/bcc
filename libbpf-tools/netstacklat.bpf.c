@@ -10,7 +10,7 @@
 #include "maps.bpf.h"
 #include "core_fixes.bpf.h"
 
-// Mimic macros from /include/net/tcp.h
+/* Mimic macros from /include/net/tcp.h */
 #define tcp_sk(ptr) container_of(ptr, struct tcp_sock, inet_conn.icsk_inet.sk)
 #define TCP_SKB_CB(__skb)	((struct tcp_skb_cb *)&((__skb)->cb[0]))
 
@@ -84,7 +84,7 @@ static u32 get_exp2_histogram_bucket_idx(u64 value, u32 max_bucket)
 {
 	u32 bucket = log2l(value);
 
-	// Right-inclusive histogram, so "round up" the log value
+	/* Right-inclusive histogram, so "round up" the log value */
 	if (bucket > 0 && 1ULL << bucket < value)
 		bucket++;
 
@@ -110,13 +110,13 @@ static void increment_exp2_histogram_nosync(void *map, struct hist_key key,
 	u64 *bucket_count;
 	u64 zero = 0;
 
-	// Increment histogram
+	/* Increment histogram */
 	key.bucket = get_exp2_histogram_bucket_idx(value, max_bucket);
 	bucket_count = bpf_map_lookup_or_try_init(map, &key, &zero);
 	if (bucket_count)
 		(*bucket_count)++;
 
-	// Increment sum at end of histogram
+	/* Increment sum at end of histogram */
 	if (value == 0)
 		return;
 
@@ -158,7 +158,7 @@ static bool filter_ifindex(u32 ifindex)
 	u64 *ifindex_ok;
 
 	if (!user_config.filter_ifindex)
-		// No ifindex filter - all ok
+		/* No ifindex filter - all ok */
 		return true;
 
 	ifindex_ok = bpf_map_lookup_elem(&netstack_ifindexfilter, &ifindex);
@@ -222,7 +222,7 @@ static bool filter_pid(u32 pid)
 	u64 *pid_ok;
 
 	if (!user_config.filter_pid)
-		// No PID filter - all PIDs ok
+		/* No PID filter - all PIDs ok */
 		return true;
 
 	pid_ok = bpf_map_lookup_elem(&netstack_pidfilter, &pid);
@@ -235,7 +235,7 @@ static bool filter_pid(u32 pid)
 static bool filter_cgroup(u64 cgroup_id)
 {
 	if (!user_config.filter_cgroup)
-		// No cgroup filter - all cgroups ok
+		/* No cgroup filter - all cgroups ok */
 		return true;
 
 	return bpf_map_lookup_elem(&netstack_cgroupfilter, &cgroup_id) != NULL;
@@ -350,7 +350,7 @@ static int current_max_possible_ooo_seq(struct tcp_sock *tp, u32 *seq)
 			return err;
 		}
 
-		// Sanity check - ooo_last_skb->cb.end_seq within the receive window?
+		/* Sanity check - ooo_last_skb->cb.end_seq within the receive window? */
 		err = get_current_rcv_wnd_end(tp, rcv_nxt, &cur_rcv_window);
 		if (err)
 			return err;
@@ -379,7 +379,7 @@ static bool tcp_read_in_ooo_range(struct tcp_sock *tp,
 	err = bpf_core_read(&read_seq, sizeof(read_seq), &tp->copied_seq);
 	if (err) {
 		bpf_printk("failed to read tcp_sock->copied_seq, err=%d", err);
-		return true; // Assume we may be in ooo-range
+		return true; /* Assume we may be in ooo-range */
 	}
 
 	if (u32_lt(ooo_range->ooo_seq_end, read_seq)) {
@@ -401,7 +401,7 @@ static bool tcp_read_maybe_holblocked(struct sock *sk)
 	if (err) {
 		bpf_printk("failed to read tcp_sock->rcv_ooopack, err=%d\n",
 			   err);
-		return true; // Assume we may be in ooo-range
+		return true; /* Assume we may be in ooo-range */
 	}
 
 	if (n_ooopkts == 0)
@@ -412,10 +412,10 @@ static bool tcp_read_maybe_holblocked(struct sock *sk)
 	if (!ooo_range) {
 		bpf_printk(
 			"failed getting ooo-range socket storage for tcp socket");
-		return true; // Assume we may be in ooo-range
+		return true; /* Assume we may be in ooo-range */
 	}
 
-	// Increase in ooo-packets since last - figure out next safe seq
+	/* Increase in ooo-packets since last - figure out next safe seq */
 	if (n_ooopkts > ooo_range->prev_n_ooopkts) {
 		ooo_range->prev_n_ooopkts = n_ooopkts;
 		err = current_max_possible_ooo_seq(tp, &nxt_seq);

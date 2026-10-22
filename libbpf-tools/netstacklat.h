@@ -13,12 +13,12 @@
 
 #define NS_PER_S 1000000000
 
-// The highest possible PID on a Linux system (from /include/linux/threads.h)
+/* Highest possible PID on a Linux system (from /include/linux/threads.h) */
 #define PID_MAX_LIMIT (4 * 1024 * 1024)
-// The maximum number of entries in the ifindex filter map
+/* Maximum number of entries in the ifindex filter map */
 #define IFINDEX_MAX_MAP_SIZE 65536
 
-// Maximum number of PIDs/ifaces/cgroups to read from the user and filter for
+/* Maximum number of PIDs/ifaces/cgroups to read from the user and filter for */
 #define MAX_PARSED_PIDS 4096
 #define MAX_PARSED_IFACES 4096
 #define MAX_PARSED_CGROUPS 4096
@@ -65,8 +65,8 @@ enum netstacklat_hook {
 struct hist_key {
 	__u64 cgroup;
 	__u32 ifindex;
-	__u16 hook; // need well defined size for ebpf-exporter to decode
-	__u16 bucket; // needs to be last to be compatible with ebpf-exporter
+	__u16 hook; /* need well defined size for ebpf-exporter to decode */
+	__u16 bucket; /* needs to be last to be compatible with ebpf-exporter */
 };
 
 struct netstacklat_bpf_config {

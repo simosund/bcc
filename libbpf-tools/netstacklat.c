@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
-#define _GNU_SOURCE // to get name_to_handle_at
+#define _GNU_SOURCE /* to get name_to_handle_at */
 #include <stdio.h>
 #include <unistd.h>
 #include <errno.h>
@@ -41,7 +41,7 @@
 #define NETSTACKLAT_EPOLL_TYPE_MASK \
 	(NETSTACKLAT_EPOLL_SIG | NETSTACKLAT_EPOLL_TIMER)
 
-// Magical value used to indicate that the program should be aborted
+/* Magical value used to indicate that the program should be aborted */
 #define NETSTACKLAT_ABORT 424242
 
 #define MAX_BUCKETSPAN_STRLEN 16
@@ -80,9 +80,9 @@ struct id_name {
 struct cgroup_idpath_map {
 	char cgroup_path[PATH_MAX];
 	struct id_name *idpath_map;
-	size_t max_size; // max size of id_pathmap
-	size_t current_size; // current size of idpath_map
-	size_t searcheable; // subset of current_size that can be looked up
+	size_t max_size; /* max size of id_pathmap */
+	size_t current_size; /* current size of idpath_map */
+	size_t searcheable; /* subset of current_size that can be looked up */
 };
 
 struct env {
@@ -380,7 +380,7 @@ static int parse_strlist_to_arr(const char *_str, void *arr, size_t nelem,
 	}
 
 	if (tokstr)
-		// Parsed size values, but more still remain
+		/* Parsed size values, but more still remain */
 		err = -E2BIG;
 
 exit:
@@ -452,7 +452,7 @@ static int parse_iface(const char *str, void *ifindexout)
 
 	ifindex = if_nametoindex(str);
 	if (ifindex == 0) {
-		// Not a valid interface name - try parsing it as an index instead
+		/* Not a valid interface name - try parsing as index instead */
 		err = parse_bounded_long(&lval, str, 1, UINT32_MAX,
 					 "interface");
 		if (!err)
@@ -534,7 +534,7 @@ static int parse_cgroup(const char *str, void *cgroupout)
 	long long lval;
 	__u64 cgroup;
 
-	// assume relative path from cgroup_mount if not starting with /
+	/* assume relative path from cgroup_mount if not starting with '/' */
 	len = snprintf(full_cgroup_path, sizeof(full_cgroup_path), "%s/%s",
 		       str[0] == '/' ? "" : cgroup_mount_path, str);
 	if (len < 0)
@@ -545,7 +545,7 @@ static int parse_cgroup(const char *str, void *cgroupout)
 	cgroup = get_cgroup_id_from_path(full_cgroup_path);
 
 	if (cgroup == 0) {
-		// Not a valid cgroup path - try parse it as an int instead
+		/* Not a valid cgroup path - try parse it as an int instead */
 		err = parse_bounded_long(&lval, str, 1, INT64_MAX, "cgroup");
 		if (!err)
 			cgroup = lval;
@@ -574,7 +574,7 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 	char *buf;
 
 	switch (key) {
-	case 'r': // report-interval
+	case 'r': /* report-interval */
 		ret = parse_bounded_double(&fval, arg, 0.01, 3600 * 24,
 					   argp_name_from_key(key));
 		if (ret)
@@ -582,10 +582,10 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 
 		env->report_interval_s = fval;
 		break;
-	case 'y': // include-hol-delay
+	case 'y': /* include-hol-delay */
 		env->bpf_conf.include_hol_blocked = true;
 		break;
-	case 'm': // cgroup-mount
+	case 'm': /* cgroup-mount */
 		if (arg[0] == '\0') {
 			argp_error(state, "%s must be non-empty",
 				   argp_name_from_key(key));
@@ -598,7 +598,7 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 
 		strcpy(cgroup_mount_path, arg);
 		break;
-	case 'e': // enable-probes
+	case 'e': /* enable-probes */
 		if (env->has_disabled_hooks)
 			goto err_enable_and_disable_probes;
 
@@ -608,7 +608,7 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 
 		env->has_enabled_hooks = true;
 		break;
-	case 'd': // disable-probes
+	case 'd': /* disable-probes */
 		if (env->has_enabled_hooks)
 			goto err_enable_and_disable_probes;
 
@@ -616,17 +616,17 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		if (ret)
 			goto err_parse_arg;
 
-		// invert enabled -> disabled
+		/* invert enabled -> disabled */
 		for (i = 1; i < NETSTACKLAT_N_HOOKS; i++)
 			env->enabled_hooks[i] = !env->enabled_hooks[i];
 
 		env->has_disabled_hooks = true;
 		break;
-	case 'l': // list-probes
+	case 'l': /* list-probes */
 		list_hooks(stdout);
-		exit(EXIT_SUCCESS); // return some code?
+		exit(EXIT_SUCCESS);
 		break;
-	case 'p': // pids
+	case 'p': /* pids */
 		ret = parse_pids(ARRAY_SIZE(env->pids) - env->npids,
 				 env->pids + env->npids, arg);
 		if (ret < 0)
@@ -635,21 +635,21 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		env->npids += ret;
 		env->bpf_conf.filter_pid = true;
 		break;
-	case 'c': // cgroups
+	case 'c': /* cgroups */
 		/*
 		 * Need to delay parsing cgroups until we can be certain that
 		 * any --cgroup-mount option has been processed. Save the
 		 * arguments to process later
 		 */
 		if (!env->cgroups_str) {
-			// first time --cgroup option is provided
+			/* first time --cgroup option is provided */
 			env->cgroups_str = strdup(arg);
 			if (!env->cgroups_str) {
 				ret = errno;
 				goto err_alloc;
 			}
 		} else {
-			// cgroups have been provided previously - append
+			/* cgroups have been provided previously - append */
 			size = strlen(env->cgroups_str) + strlen(arg) + 2;
 			buf = malloc(size);
 			if (!buf) {
@@ -663,7 +663,7 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		}
 
 		break;
-	case 'i': // interfaces
+	case 'i': /* interfaces */
 		ret = parse_ifaces(ARRAY_SIZE(env->ifindices) - env->nifindices,
 				   env->ifindices + env->nifindices, arg);
 		if (ret < 0)
@@ -672,13 +672,13 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		env->nifindices += ret;
 		env->bpf_conf.filter_ifindex = true;
 		break;
-	case 'n': // netns
+	case 'n': /* netns */
 		ret = parse_bounded_long(&lval, arg, -1, UINT32_MAX,
 					 argp_name_from_key(key));
 		if (ret)
 			goto err_parse_arg;
 
-		// include all netns (no filtering)
+		/* include all netns (no filtering) */
 		if (lval < 0) {
 			env->bpf_conf.network_ns = 0;
 			/*
@@ -687,19 +687,19 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 			 * an interface (and corresponding interface name).
 			 */
 			env->translate_ifindex = false;
-		// use current netns
+		/* use current netns */
 		} else if (lval == 0) {
-			; // keep initialized value
+			; /* keep initialized value */
 		} else if (lval != env->bpf_conf.network_ns) {
 			env->bpf_conf.network_ns = lval;
 			/*
-			 * No simple way to get ifindex to interface name
+			 * No simple way to translate ifindex to interface name
 			 * in a different network namespace.
 			 */
 			env->translate_ifindex = false;
 		}
 		break;
-	case 'q': // min-queuelength
+	case 'q': /* min-queuelength */
 		ret = parse_bounded_long(&lval, arg, 0, 65536,
 					 argp_name_from_key(key));
 		if (ret)
@@ -707,10 +707,10 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 
 		env->bpf_conf.filter_min_sockqueue_len = lval;
 		break;
-	case 'I': // groupby-interface
+	case 'I': /* groupby-interface */
 		env->bpf_conf.groupby_ifindex = true;
 		break;
-	case 'C': // groupby-cgroup
+	case 'C': /* groupby-cgroup */
 		env->bpf_conf.groupby_cgroup = true;
 		break;
 	case ARGP_KEY_END:
@@ -744,7 +744,7 @@ err_enable_and_disable_probes:
 		   argp_name_from_key('e'), argp_name_from_key('d'));
 	return EEXIST;
 err_alloc:
-	// Not a user error - so don't use argp_error()
+	/* Not a user error - so don't use argp_error() */
 	fprintf(stderr, "Failed to copy %s argument: %s\n",
 		argp_name_from_key(key), strerror(ret));
 	return ret;
@@ -762,7 +762,7 @@ static int parse_args(int argc, char *argv[], struct env *env)
 	env->report_interval_s = 0;
 
 	for (i = 0; i < NETSTACKLAT_N_HOOKS; i++)
-		// All probes enabled by default
+		/* All probes enabled by default */
 		env->enabled_hooks[i] = true;
 
 	current_netns = get_current_network_ns();
@@ -853,7 +853,7 @@ static int update_cgroup_idpath(struct cgroup_idpath_map *cgmap,
 		return add_cgroup_idpath(cgmap, cgroup_id, cgroup_path,
 					 searchable);
 
-	// Update cgroup path for existing id-path mapping (if different)
+	/* Update cgroup path for existing id-path mapping (if different) */
 	if (strcmp(cgroup->name, cgroup_path) == 0)
 		return 0;
 
@@ -917,7 +917,7 @@ static int update_cgroup_idpath_map(struct cgroup_idpath_map *cgmap)
 		if (err)
 			break;
 	}
-	// catch potential errno from fts_read()
+	/* catch potential errno from fts_read() */
 	err = err ?: -errno;
 
 	fts_close(fts_tree);
@@ -1032,13 +1032,13 @@ static int format_ifindex(__u32 ifindex, bool translate_to_name, char *buf,
 {
 	int len;
 
-	// just format as a number
+	/* just format as a number */
 	if (!translate_to_name) {
 		len = snprintf(buf, size, "%u", ifindex);
 		return len < 0 ? -errno : len >= size ? -E2BIG : 0;
 	}
 
-	// translate to ifname
+	/* translate to ifname */
 	if (size < IF_NAMESIZE)
 		return -E2BIG;
 	if (!if_indextoname(ifindex, buf))
@@ -1099,7 +1099,7 @@ static __u64 diff_histentry(struct histogram_entry *entry, size_t n,
 		count += diff[i];
 	}
 
-	// The last "bucket" is actually a sum
+	/* The last "bucket" is actually a sum */
 	*sum = entry->current_buckets[n - 1] - entry->prev_buckets[n - 1];
 	entry->prev_buckets[n - 1] = entry->current_buckets[n - 1];
 
@@ -1115,7 +1115,7 @@ static void print_histentry(struct histogram_entry *entry, struct env *env,
 	double avg;
 
 	count = diff_histentry(entry, HIST_NBUCKETS, diff, &sum);
-	// Skip reporting entires with no change (empty histogram)
+	/* Skip reporting entires with no change (empty histogram) */
 	if (!count)
 		return;
 
@@ -1125,7 +1125,6 @@ static void print_histentry(struct histogram_entry *entry, struct env *env,
 	print_hist(diff, ARRAY_SIZE(diff), "delay", log2_le_bin_edge, NULL,
 		   format_nanosecond_delay, false);
 
-	// Final "bucket" is the sum of all values in the histogram
 	if (count > 0) {
 		avg = ns_to_siprefix((double)sum / count, &prefix);
 		printf("count: %llu, average: %.2f%ss\n", count, avg, prefix);
@@ -1170,7 +1169,7 @@ lookup_or_zeroinit_hist(const struct hist_key *key,
 	if (hist)
 		return hist;
 
-	// No matching histogram key found - create new histogram entry and insert it
+	/* No matching hist key found - create new hist entry and insert it */
 	if (buf->current_size >= buf->max_size) {
 		errno = ENOSPC;
 		return NULL;
@@ -1256,7 +1255,7 @@ static int fetch_histograms(int map_fd, struct histogram_buffer *buf)
 					   nentries > 0 ? &in_batch : NULL,
 					   &out_batch, keys, percpu_buckets,
 					   &count, &batch_opts);
-		if (err == -ENOENT) { // All entries fetched
+		if (err == -ENOENT) { /* All entries fetched */
 			entries_remain = false;
 			err = 0;
 		} else if (err) {
@@ -1277,7 +1276,7 @@ static int fetch_histograms(int map_fd, struct histogram_buffer *buf)
 				err2 = -ETOOMANYREFS;
 				err = 0;
 			} else if (err) {
-				// Critical error - abort
+				/* Critical error - abort */
 				goto exit;
 			}
 		}
@@ -1476,7 +1475,7 @@ static int set_map_sizes(const struct env *env,
 		return err;
 	}
 
-	// PID filter - arraymap, needs max PID + 1 entries
+	/* PID filter - arraymap, needs max PID + 1 entries */
 	for (i = 0, size = 1; i < env->npids; i++) {
 		if (env->pids[i] >= size)
 			size = env->pids[i] + 1;
@@ -1512,7 +1511,7 @@ static int set_map_sizes(const struct env *env,
 		return err;
 	}
 
-	// cgroup filter - hashmap, should be ~2x expected number of entries
+	/* cgroup filter - hashmap, should be ~2x expected number of entries */
 	size = env->bpf_conf.filter_cgroup ? env->ncgroups * 2 : 1;
 	err = bpf_map__set_max_entries(obj->maps.netstack_cgroupfilter, size);
 	if (err) {
@@ -1838,13 +1837,13 @@ int main(int argc, char *argv[])
 		goto exit_timerfd;
 	}
 
-	// Report stats until user shuts down program
+	/* Report stats until user shuts down program */
 	while (true) {
 		err = poll_events(epoll_fd, &env, obj, &hist_buf);
 
 		if (err) {
 			if (err == NETSTACKLAT_ABORT) {
-				// Report stats a final time before terminating
+				/* Report stats a final time before terminating */
 				err = report_stats(&env, obj, &hist_buf);
 			} else {
 				libbpf_strerror(err, errmsg, sizeof(errmsg));
@@ -1855,7 +1854,7 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	// Cleanup
+	/* Cleanup */
 	close(epoll_fd);
 exit_timerfd:
 	close(timer_fd);
