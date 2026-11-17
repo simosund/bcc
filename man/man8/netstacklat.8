@@ -1,4 +1,4 @@
-.TH netstacklat 8  "2026-08-07" "USER COMMANDS"
+.TH netstacklat 8  "2026-11-17" "USER COMMANDS"
 .SH NAME
 netstacklat \- Summarize ingress network stack latency in histograms.
 .SH SYNOPSIS
@@ -8,15 +8,18 @@ netstacklat \- Summarize ingress network stack latency in histograms.
 netstacklat monitors the time that network packets (SKBs) have spent
 in the ingress network stack at various points. This latency is
 recorded in log2 histograms, which are reported on shutdown or at
-fixed intervals (--report-interval). Alternatively, netstacklat can be
-used with ebpf-exporter to allow Prometheus to ingest the data.
+fixed intervals (\-\-report-interval). netstacklat attempts to be
+compatible with ebpf_exporter to allow Prometheus to ingest the
+data. Use with ebpf_exporter requires additional steps, see the
+"USE WITH EBPF_EXPORTER" section.
 
 The network stack latency is measured against the SKB timestamp
 (sk_buff\->tstamp), which the kernel sets (through
 SOF_TIMESTAMPING_RX_SOFTWARE) at the start of the network stack
-processing (in e.g. netif_receive_skb_internal()). This allows eBPF
-programs at any time to efficiently check the how long an SKB have
-spent in the stack without having to keep any separate per-SKB state.
+processing (in e.g. netif_receive_skb_internal()). This allows
+netstacklat's eBPF probes to efficiently check the how long an SKB
+have spent in the stack without having to keep any separate per-SKB
+state.
 
 netstacklat requires Linux 6.1 or later because it uses the
 bpf_ktime_get_tai_ns() helper.
@@ -129,7 +132,7 @@ Summarize tcp-socket-read latency for nginx and prometheus services per network 
 #
 .B netstacklat \-IC \-e tcp\-socket\-read \-c system.slice/nginx.service,system.slice/prometheus.service
 .TP
-Run netstacklat with ebpf-exporter to export the data to Prometheus
+Run netstacklat with ebpf_exporter to export the data to Prometheus
 #
 .B ebpf_exporter \-\-config.dir=path\-to\-libbpf\-tools \-\-config.name=netstacklat
 
@@ -194,6 +197,10 @@ cgroups specified. Children of the specified cgroups will
 .B NOT
 automatically get included. All cgroup children that should be
 included have to be explicitly provided.
+.B NOTE:
+This does not apply when running netstacklat with ebpf_exporter, which
+automatically adds child cgroups to the filter.
+
 
 .SS Cgroup filtering is based on initial cgroup-ID
 netstacklat operates on cgroup-IDs rather than cgroup paths. If
@@ -202,6 +209,9 @@ those paths to the corresponding cgroup-IDs at startup. If a cgroup
 path is later recreated (e.g. a systemd unit that is restarted) it will
 receive a different cgroup-ID (cgroup-IDs are in practice not
 recycled) and will no longer be included by netstacklat.
+.B NOTE:
+This does not apply when running netstacklat with ebpf_exporter, which
+automatically updates the cgroup-IDs for configured cgroup paths.
 
 Likewise, data from a recreated cgroup path will be grouped separately
 from data from the prior cgroup with the same path, as the recreated
@@ -223,32 +233,36 @@ may not work as expected. netstacklat operates on interface indices
 (ifindex) rather than interface names. As each network namespace has
 its own ifindex range, netstacklat will be unable to distinguish
 between interfaces in different network namespaces that share the same
-of ifindex. Thus, if monitoring traffic from multiple namespaces,
+ifindex. Thus, if monitoring traffic from multiple namespaces,
 netstacklat will include traffic from all interfaces with a matching
 ifindex and group all traffic with the same ifindex in the same
 interface group.
 
 .SH USE WITH EBPF_EXPORTER
-netstacklat is compatible with ebpf_exporter (i.e. its BPF maps store
-the data in a format ebpf_exporter can parse). By using ebpf_exporter,
-the netstacklat latency data can be exported to Prometheus
-collectors. However, to successfully run netstacklat with
-ebpf-exporter, some precautions must be taken.
+netstacklat is designed to be compatible with ebpf_exporter, meaning
+that the BPF maps netstacklat uses to store measurements have a format
+that ebpf_exporter should be able to parse. By loading netstacklat
+with ebpf_exporter, the netstacklat latency measurements can be
+exported to Prometheus collectors. However, to successfully run
+netstacklat with ebpf_exporter, the tool must be built from source and
+the following precautions should be taken:
 
 .SS File locations and ebpf_exporter config
 ebpf_exporter needs two things to export data from an eBPF program:
 the compiled eBPF program ELF file (netstacklat.bpf.o) and a YAML
 config file (netstacklat.yaml) describing the data format of the BPF
-maps it should parse. netstacklat includes a ebpf_exporter config in
-the libbpf-tools directory. However, the libbpf-tools build process
-does not include the ELF file among the normal artifacts (instead
-embedding the ELF file within the stand-alone user space
-application). The ELF-file is still built, and can be found in
-the .output subfolder, so just ensure that both the config file and
-the ELF-file reside inside a common folder (e.g. by copying
-netstacklat.bpf.o from libbpf-tools/.output/ to libbpf-tools/). You
-can then run netstacklat with ebpf_exporter by providing it with the
-path to where the ELF and config files reside (e.g. libbpf-tools/).
+maps it should parse. netstacklat includes an example ebpf_exporter
+config in the libbpf-tools directory (note that the configuration may
+need to be tweaked if it has not been kept up-to-date with changes in
+the eBPF code). However, the libbpf-tools build process does not
+include the ELF file among the normal artifacts (instead embedding the
+ELF file within the stand-alone user space application). The ELF-file
+is still built, and can be found in the .output subfolder, so ensure
+that both the config file and the ELF-file reside inside a common
+folder (e.g. by copying netstacklat.bpf.o from libbpf-tools/.output/
+to libbpf-tools/). You can then run netstacklat with ebpf_exporter by
+providing it with the path to where the ELF and config files reside
+(e.g. libbpf-tools/).
 
 .IP
 #
@@ -260,7 +274,7 @@ path to where the ELF and config files reside (e.g. libbpf-tools/).
 .SS Configuring netstacklat options
 ebpf_exporter replaces netstacklat's custom user space agent
 (netstacklat.c), loading the netstacklat eBPF programs and exporting
-the data stored in BPF maps to Prometheus collectors. As ebpf-exporter
+the data stored in BPF maps to Prometheus collectors. As ebpf_exporter
 is a generic eBPF program loader, it cannot directly deal with the
 different command-line options that the ordinary netstacklat agent
 supports.
@@ -289,22 +303,22 @@ which the ordinary netstacklat user agent checks before loading the
 eBPF programs (see get_tai_offset() in netstacklat.c).
 
 When running netstacklat with ebpf_exporter, the user must ensure that
-the TAI_OFFSET constant is initialized to same value as the system's
-TAI offset. Just like the other constants, this can be achieved by
-modifying the TAI_OFFSET constant in the netstacklat.bpf.c source and
-recompiling.  While the TAI_OFFSET by default is initialized to the
-current actual TAI offset (37 seconds, since 2016), this may not be
-the TAI offset used on your system. Notably, some systems
-(e.g. default Ubuntu) will not set the TAI offset at all, in which
-case the TAI_OFFSET should be 0.
+the TAI_OFFSET constant is initialized to the same value as the
+system's TAI offset. Just like the other constants, this can be
+achieved by modifying the TAI_OFFSET constant in the netstacklat.bpf.c
+source and recompiling. While the TAI_OFFSET by default is initialized
+to the real TAI offset (37 seconds, since the final leap second in
+2016), this may not be the TAI offset used on your system. Notably,
+some systems (e.g. some Ubuntu distributions) will not set the TAI
+offset at all, in which case the TAI_OFFSET should be 0.
 
 .SS Updating filtering maps
 In addition to requiring the corresponding rodata constants being set,
 the netstacklat options \-\-interfaces, \-\-pids, and \-\-cgroups also
 rely on BPF maps where entries are set to 1 to indicate which
 interfaces/pids/cgroups to include. These are normally filled by the
-netstacklat user space agent, but when used ebpf_exporter they must be
-filled by other means.
+netstacklat user space agent, but when using ebpf_exporter they must be
+filled through other means.
 
 For cgroups, ebpf_exporter will automatically manage the cgroup filter
 map based on the YAML config file. Ensure the regexps in the
@@ -320,7 +334,7 @@ of interfaces to include, use the following command:
 .B bpftool map update name netstack_ifinde key 0x03 0x00 0x00 0x00 value 1 0 0 0 0 0 0 0
 
 .P
-Note that the above example assume a little-endian system. On a
+Note that the above example assumes a little-endian system. On a
 big-endian system the key and value bytes should instead be given in
 big-endian order (e.g. key 0x00 0x00 0x00 0x03).
 
@@ -336,11 +350,18 @@ accomplished).
 
 .SH REFERENCES
 An extensive description and evaluation of netstacklat is available in
-the conference paper at <https://doi.org/10.48550/arXiv.2606.02057>. A
-summary of the same content is also available at
-<https://research.redhat.com/blog/article/monitoring-latency-within-the-end-host-network-stack/>. A
-demo of how netstacklat can be used is available at
-<https://developers.redhat.com/articles/2026/04/29/boosting-speed-use-ebpf-and-netstacklat-troubleshoot-latency>.
+the IMC'26 conference paper at
+.UR https://doi.org/10.1145/3777912.3809152
+.UE .
+A summary of the same content is also available at
+.UR https://research.redhat.com/blog/article/monitoring-latency-within-the-end-host-network-stack
+.UE .
+A demo of how netstacklat can be used is available at
+.UR https://developers.redhat.com/articles/2026/04/29/boosting-speed-use-ebpf-and-netstacklat-troubleshoot-latency
+.UE .
+The ebpf_exporter tool is available at
+.UR https://github.com/cloudflare/ebpf_exporter
+.UE .
 
 .SH AUTHOR
 Simon Sundberg, Jesper Dangaard Brouer
